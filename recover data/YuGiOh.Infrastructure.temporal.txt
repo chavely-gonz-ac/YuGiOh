@@ -1,0 +1,4620 @@
+===== CachingService/RedisCacheOptions.cs =====
+using System.ComponentModel.DataAnnotations;
+
+namespace YuGiOh.Infrastructure.CachingService
+{
+    /// <summary>
+    /// Represents the configuration settings used for connecting to a Redis cache instance.
+    /// These options are typically bound from the application's configuration file (e.g., appsettings.json)
+    /// under a section such as <c>"RedisCacheOptions"</c>.
+    /// </summary>
+    public class RedisCacheOptions
+    {
+        /// <summary>
+        /// Gets or sets the connection string used to establish a connection to the Redis server.
+        /// This property is required and must contain a valid configuration string 
+        /// (e.g., "localhost:6379" or "myredis:6380,password=secret,ssl=True").
+        /// </summary>
+        [Required]
+        public required string Configuration { get; set; }
+
+        /// <summary>
+        /// Gets or sets an optional name prefix for this Redis instance.
+        /// This can be used to isolate cache keys between different environments 
+        /// (e.g., "Dev", "Prod") or subsystems within the same Redis server.
+        /// </summary>
+        public string? InstanceName { get; set; }
+
+        /// <summary>
+        /// Gets or sets the default time-to-live (TTL) in seconds for cache entries.
+        /// If not specified when setting a value in cache, this value determines 
+        /// how long an entry will remain valid before expiring automatically.
+        /// The default is 600 seconds (10 minutes).
+        /// </summary>
+        public int DefaultTTLSeconds { get; set; } = 600;
+
+        /// <summary>
+        /// Gets or sets the separator string used to construct composite cache keys.
+        /// The default separator is a colon (<c>":"</c>), resulting in keys like <c>"InstanceName:Type:Id"</c>.
+        /// </summary>
+        public string KeySeparator { get; set; } = ":";
+    }
+}
+
+
+===== CachingService/RedisCachingServiceBasicCRUD.cs =====
+using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using YuGiOh.Domain.Exceptions;
+
+namespace YuGiOh.Infrastructure.CachingService
+{
+    /// <summary>
+    /// Provides CRUD-style operations for Redis-based caching, including methods to 
+    /// set, retrieve, remove, and check for cached entries.
+    /// </summary>
+    /// <remarks>
+    /// This class represents one part of the <see cref="RedisCachingService"/> partial definition.
+    /// It is designed for generic usage and type-safe serialization/deserialization using <see cref="JsonSerializer"/>.
+    /// </remarks>
+    public partial class RedisCachingService
+    {
+        /// <summary>
+        /// Stores a value in Redis cache with the specified key and optional expiration.
+        /// </summary>
+        /// <typeparam name="T">The type of the value being cached.</typeparam>
+        /// <param name="key">The unique cache key identifying the entry.</param>
+        /// <param name="value">The value to be cached.</param>
+        /// <param name="expiry">
+        /// Optional expiration time. If not provided, the default TTL from <see cref="RedisCacheOptions.DefaultTTLSeconds"/> is used.
+        /// </param>
+        public async Task SetAsync<T>(string key, T value, TimeSpan? expiry = null)
+        {
+            if (string.IsNullOrWhiteSpace(key))
+                throw APIException.BadRequest("Cache key cannot be null or whitespace.", nameof(key));
+
+            try
+            {
+                // Serialize the value to JSON and set it in Redis with TTL
+                var serialized = JsonSerializer.Serialize(value, _jsonOptions);
+                var ttl = expiry ?? TimeSpan.FromSeconds(_options.DefaultTTLSeconds);
+                await _db.StringSetAsync(GetCacheKey(typeof(T).Name, key), serialized, ttl)
+                         .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to cache key {Key} for type {Type}", key, typeof(T).Name);
+                throw APIException.Internal("Failed to write to Redis cache.", ex.Message, ex);
+            }
+        }
+
+        /// <summary>
+        /// Retrieves a cached value by key and deserializes it to the specified type.
+        /// </summary>
+        /// <typeparam name="T">The expected type of the cached value.</typeparam>
+        /// <param name="key">The cache key to look up.</param>
+        /// <returns>
+        /// The cached object if found and successfully deserialized; otherwise, <c>default(T)</c>.
+        /// </returns>
+        public async Task<T?> GetAsync<T>(string key)
+        {
+            if (string.IsNullOrWhiteSpace(key))
+                throw APIException.BadRequest("Cache key cannot be null or whitespace.", nameof(key));
+
+            var cacheKey = GetCacheKey(typeof(T).Name, key);
+            try
+            {
+                var val = await _db.StringGetAsync(cacheKey).ConfigureAwait(false);
+                if (!val.HasValue) return default;
+
+                // Deserialize JSON value to the target type
+                return JsonSerializer.Deserialize<T>(val!, _jsonOptions);
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogWarning(ex, "Corrupted cache for key {Key}, removing entry.", cacheKey);
+                await _db.KeyDeleteAsync(cacheKey);
+                return default;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error reading cache key {Key}", cacheKey);
+                throw APIException.Internal("Failed to read from Redis cache.", ex.Message, ex);
+            }
+        }
+
+        /// <summary>
+        /// Attempts to retrieve a cached value; if not found, executes a factory function 
+        /// to create it, stores it in cache, and returns the result.
+        /// </summary>
+        /// <typeparam name="T">The type of the cached value.</typeparam>
+        /// <param name="key">The cache key used to identify the entry.</param>
+        /// <param name="factory">A function that generates the value when it is not found in cache.</param>
+        /// <param name="expiry">Optional expiration time for the cached value.</param>
+        /// <returns>
+        /// The cached or newly created value.
+        /// </returns>
+        public async Task<T> GetOrCreateAsync<T>(string key, Func<Task<T>> factory, TimeSpan? expiry = null)
+        {
+            if (string.IsNullOrWhiteSpace(key))
+                throw APIException.BadRequest("Cache key cannot be null or whitespace.", nameof(key));
+            if (factory == null)
+                throw APIException.BadRequest("Value factory cannot be null.");
+
+            var cacheKey = GetCacheKey(typeof(T).Name, key);
+
+            // Try retrieving from cache
+            var redisVal = await _db.StringGetAsync(cacheKey).ConfigureAwait(false);
+            if (redisVal.HasValue)
+            {
+                try
+                {
+                    return JsonSerializer.Deserialize<T>(redisVal!, _jsonOptions)!;
+                }
+                catch (JsonException ex)
+                {
+                    _logger.LogWarning(ex,
+                        "Failed to deserialize cached entry for key {Key}. Removing corrupted data.",
+                        cacheKey);
+                    await _db.KeyDeleteAsync(cacheKey);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex,
+                        "Unexpected error when deserializing cached entry for key {Key}. Removing entry.",
+                        cacheKey);
+                    await _db.KeyDeleteAsync(cacheKey);
+                    throw APIException.Internal("Unexpected error deserializing Redis cache entry.", ex.Message, ex);
+                }
+            }
+
+            // Cache miss: call factory to get value
+            try
+            {
+                var result = await factory().ConfigureAwait(false);
+                if (result != null)
+                    await SetAsync(key, result, expiry);
+                return result;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error creating or storing value for cache key {Key}", key);
+                throw APIException.Internal("Failed to generate or cache a value.", ex.Message, ex);
+            }
+        }
+
+        /// <summary>
+        /// Removes a cached entry for the given key and type.
+        /// </summary>
+        /// <typeparam name="T">The type of the cached value.</typeparam>
+        /// <param name="key">The cache key to remove.</param>
+        public async Task RemoveAsync<T>(string key)
+        {
+            if (string.IsNullOrWhiteSpace(key))
+                throw APIException.BadRequest("Cache key cannot be null or whitespace.", nameof(key));
+
+            try
+            {
+                await _db.KeyDeleteAsync(GetCacheKey(typeof(T).Name, key)).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to remove cache key {Key}", key);
+                throw APIException.Internal("Failed to remove cache entry from Redis.", ex.Message, ex);
+            }
+        }
+
+        /// <summary>
+        /// Checks whether a cached entry exists for the given key and type.
+        /// </summary>
+        /// <typeparam name="T">The type of the cached value.</typeparam>
+        /// <param name="key">The cache key to check.</param>
+        /// <returns><c>true</c> if the cache entry exists; otherwise, <c>false</c>.</returns>
+        public async Task<bool> ExistsAsync<T>(string key)
+        {
+            if (string.IsNullOrWhiteSpace(key))
+                throw APIException.BadRequest("Cache key cannot be null or whitespace.", nameof(key));
+
+            try
+            {
+                return await _db.KeyExistsAsync(GetCacheKey(typeof(T).Name, key)).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to check existence of cache key {Key}", key);
+                throw APIException.Internal("Failed to check Redis cache entry existence.", ex.Message, ex);
+            }
+        }
+    }
+}
+
+
+===== CachingService/RedisCachingServiceConstructor.cs =====
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using Microsoft.Extensions.Options;
+using StackExchange.Redis;
+using YuGiOh.Domain.Repositories;
+using Microsoft.Extensions.Logging;
+using YuGiOh.Domain.Exceptions;
+
+namespace YuGiOh.Infrastructure.CachingService
+{
+    /// <summary>
+    /// Provides Redis-based caching functionality that supports storing, retrieving,
+    /// and removing cached data in a strongly typed and consistent way.
+    /// </summary>
+    /// <remarks>
+    /// This is the constructor and setup portion of the <see cref="RedisCachingService"/> class.
+    /// It establishes the Redis connection, configures serialization behavior, and 
+    /// defines key naming conventions and prefixing.
+    /// </remarks>
+    public partial class RedisCachingService : ICachingRepository
+    {
+        private readonly IConnectionMultiplexer _multiplexer;
+        private readonly IDatabase _db;
+        private readonly RedisCacheOptions _options;
+        private readonly JsonSerializerOptions _jsonOptions;
+        private readonly string _prefix;
+        private readonly ILogger<RedisCachingService> _logger;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="RedisCachingService"/> class,
+        /// configuring the Redis connection, JSON serialization, and key prefixing strategy.
+        /// </summary>
+        /// <param name="multiplexer">The Redis connection multiplexer.</param>
+        /// <param name="options">The configuration options for Redis cache.</param>
+        /// <param name="logger">The logger instance used for diagnostic and error messages.</param>
+        /// <exception cref="APIException">
+        /// Thrown when dependencies are null or Redis connection fails during initialization.
+        /// </exception>
+        public RedisCachingService(
+            IConnectionMultiplexer multiplexer,
+            IOptions<RedisCacheOptions> options,
+            ILogger<RedisCachingService> logger)
+        {
+            _multiplexer = multiplexer ?? throw APIException.BadRequest(
+                "Redis connection multiplexer cannot be null.",
+                nameof(multiplexer));
+
+            _options = options?.Value ?? throw APIException.BadRequest(
+                "Redis configuration options cannot be null.",
+                nameof(options));
+
+            _logger = logger ?? throw APIException.BadRequest(
+                "Logger instance cannot be null.",
+                nameof(logger));
+
+            try
+            {
+                _db = _multiplexer.GetDatabase();
+
+                // Validate connection immediately to ensure Redis is reachable
+                _ = _db.Ping();
+                _logger.LogInformation("Redis connection successfully established and validated.");
+            }
+            catch (RedisConnectionException ex)
+            {
+                _logger.LogError(ex, "Unable to connect to Redis during initialization.");
+                throw APIException.Internal(
+                    "Redis connection failed at startup.",
+                    ex.Message,
+                    ex);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to retrieve or validate Redis database instance.");
+                throw APIException.Internal(
+                    "Failed to initialize Redis database connection.",
+                    ex.Message,
+                    ex);
+            }
+
+            // Build cache key prefix based on the configured instance name
+            _prefix = string.IsNullOrWhiteSpace(_options.InstanceName)
+                ? string.Empty
+                : $"{_options.InstanceName}{_options.KeySeparator}";
+
+            // Configure JSON serialization settings
+            _jsonOptions = new JsonSerializerOptions
+            {
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+                WriteIndented = false
+            };
+        }
+
+        /// <summary>
+        /// Builds and returns the cache prefix (namespace) for a given logical table name.
+        /// </summary>
+        /// <param name="tableName">The logical group or table for cached data.</param>
+        /// <returns>A composed prefix string to scope cache entries.</returns>
+        public string GetCachePrefix(string tableName) => $"{_prefix}{tableName}";
+
+        /// <summary>
+        /// Generates a full cache key using the prefix, separator, and logical key.
+        /// </summary>
+        /// <param name="tableName">The logical cache group (e.g., entity name).</param>
+        /// <param name="key">The unique key for the cached entry.</param>
+        /// <returns>A fully qualified Redis cache key string.</returns>
+        public string GetCacheKey(string tableName, string key)
+            => $"{GetCachePrefix(tableName)}{_options.KeySeparator}{key}";
+    }
+}
+
+
+===== CachingService/RedisCachingServiceGroupQueries.cs =====
+using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using YuGiOh.Domain.Exceptions;
+
+namespace YuGiOh.Infrastructure.CachingService
+{
+    /// <summary>
+    /// Provides grouped cache query functionality for retrieving and filtering collections 
+    /// of cached entities with automatic fallback and refresh logic.
+    /// </summary>
+    public partial class RedisCachingService
+    {
+        /// <summary>
+        /// Retrieves a filtered collection of cached items of type <typeparamref name="T"/>.
+        /// If the cache is empty or corrupted, this method loads the data from a source 
+        /// using the specified <paramref name="loader"/> function, caches it, and then filters the results.
+        /// </summary>
+        /// <typeparam name="T">The type of entity being queried.</typeparam>
+        /// <param name="predicate">A filter function applied to the cached or loaded data.</param>
+        /// <param name="loader">A function that asynchronously loads the full dataset when the cache is empty or invalid.</param>
+        /// <param name="ttl">Optional custom time-to-live for the cached dataset.</param>
+        /// <param name="cacheKey">
+        /// Optional cache key. If not provided, the key will be built automatically using <see cref="GetCachePrefix"/>.
+        /// </param>
+        /// <returns>
+        /// A filtered collection of <typeparamref name="T"/> items that match the given <paramref name="predicate"/>.
+        /// </returns>
+        /// <exception cref="APIException">
+        /// Thrown when a required argument is null or the cache operation fails.
+        /// </exception>
+        public async Task<ICollection<T>> GroupQuery<T>(
+            Func<T, bool> predicate,
+            Func<Task<ICollection<T>>> loader,
+            TimeSpan? ttl = null,
+            string? cacheKey = null)
+        {
+            if (predicate == null)
+                throw APIException.BadRequest("Predicate cannot be null.", nameof(predicate));
+            if (loader == null)
+                throw APIException.BadRequest("Loader function cannot be null.", nameof(loader));
+
+            cacheKey ??= GetCachePrefix(typeof(T).Name);
+
+            try
+            {
+                // Attempt to retrieve data from cache
+                var cached = await GetAsync<ICollection<T>>(cacheKey).ConfigureAwait(false);
+                if (cached is { Count: > 0 })
+                {
+                    _logger.LogDebug("Cache hit for {Type} ({Count} items)", typeof(T).Name, cached.Count);
+                    return cached.Where(predicate).ToList();
+                }
+            }
+            catch (JsonException ex)
+            {
+                // If the cached entry is corrupted, remove it and continue
+                _logger.LogWarning(ex, "Corrupted cache for {Key}, clearing entry.", cacheKey);
+                await RemoveAsync<ICollection<T>>(cacheKey).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to query cache for key {Key}", cacheKey);
+                throw APIException.Internal(
+                    "Error occurred while querying Redis cache.",
+                    ex.Message,
+                    ex);
+            }
+
+            // Cache miss: load data from the provided loader
+            ICollection<T> collection;
+            try
+            {
+                collection = await loader().ConfigureAwait(false) ?? new List<T>();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Loader function failed for {Type}", typeof(T).Name);
+                throw APIException.Internal(
+                    "Failed to load data source for caching.",
+                    ex.Message,
+                    ex);
+            }
+
+            // Populate cache if data is available
+            if (collection.Count > 0)
+            {
+                try
+                {
+                    var expiry = ttl ?? TimeSpan.FromSeconds(_options.DefaultTTLSeconds);
+                    await SetAsync(cacheKey, collection, expiry).ConfigureAwait(false);
+                    _logger.LogDebug("Cache populated for {Type} ({Count} items)", typeof(T).Name, collection.Count);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to set cache for {Type}", typeof(T).Name);
+                    throw APIException.Internal(
+                        "Failed to populate Redis cache after loading data.",
+                        ex.Message,
+                        ex);
+                }
+            }
+            else
+            {
+                _logger.LogDebug("Loader returned empty result for {Type}", typeof(T).Name);
+            }
+
+            return collection.Where(predicate).ToList();
+        }
+    }
+}
+
+
+===== CachingService/ServiceExtension.cs =====
+// ===== CachingService/ServiceExtension.cs =====
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+using StackExchange.Redis;
+using YuGiOh.Domain.Repositories;
+using YuGiOh.Domain.Exceptions;
+
+namespace YuGiOh.Infrastructure.CachingService
+{
+    /// <summary>
+    /// Provides extension methods for registering Redis-based caching services
+    /// into the dependency injection container.
+    /// </summary>
+    public static class ServiceExtension
+    {
+        /// <summary>
+        /// Adds the Redis caching infrastructure and its dependencies to the application's service collection.
+        /// </summary>
+        /// <param name="services">The dependency injection service collection.</param>
+        /// <param name="configuration">The application's configuration instance.</param>
+        /// <returns>The same <see cref="IServiceCollection"/> instance for fluent chaining.</returns>
+        /// <exception cref="APIException">
+        /// Thrown when Redis configuration is missing, invalid, or connection initialization fails.
+        /// </exception>
+        public static IServiceCollection AddCachingService(this IServiceCollection services, IConfiguration configuration)
+        {
+            if (services == null)
+                throw APIException.BadRequest("Service collection cannot be null.", nameof(services));
+
+            if (configuration == null)
+                throw APIException.BadRequest("Configuration instance cannot be null.", nameof(configuration));
+
+            // Bind and validate Redis configuration options
+            services.Configure<RedisCacheOptions>(configuration.GetSection("RedisCacheOptions"));
+
+            services.AddSingleton<IConnectionMultiplexer>(sp =>
+            {
+                try
+                {
+                    var opts = sp.GetRequiredService<IOptions<RedisCacheOptions>>().Value;
+
+                    if (string.IsNullOrWhiteSpace(opts.Configuration))
+                        throw APIException.BadRequest("Redis configuration string cannot be null or empty.");
+
+                    // Parse Redis connection configuration
+                    var cfg = ConfigurationOptions.Parse(opts.Configuration);
+                    cfg.AbortOnConnectFail = false; // Prevents app from crashing if Redis temporarily unavailable
+
+                    var connection = ConnectionMultiplexer.Connect(cfg);
+
+                    // Validate connectivity immediately to fail fast on startup
+                    if (!connection.IsConnected)
+                        throw APIException.Internal("Redis connection failed during initialization.");
+
+                    return connection;
+                }
+                catch (APIException)
+                {
+                    // Rethrow known structured exceptions directly
+                    throw;
+                }
+                catch (RedisConnectionException ex)
+                {
+                    throw APIException.Internal(
+                        "Unable to establish connection with Redis server.",
+                        ex.Message,
+                        ex);
+                }
+                catch (Exception ex)
+                {
+                    throw APIException.Internal(
+                        "An unexpected error occurred while configuring Redis connection.",
+                        ex.Message,
+                        ex);
+                }
+            });
+
+            // Register Redis-based caching service as the implementation for the caching repository abstraction
+            services.AddSingleton<ICachingRepository, RedisCachingService>();
+
+            return services;
+        }
+    }
+}
+
+
+===== CSCService/CSCLoader.cs =====
+using System.Net.Http.Json;
+using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using YuGiOh.Domain.DTOs;
+using YuGiOh.Domain.Exceptions;
+
+namespace YuGiOh.Infrastructure.CSCService
+{
+    /// <summary>
+    /// Provides methods for fetching hierarchical geographic data (countries, states, cities)
+    /// from the external CSC (Country-State-City) API.
+    /// </summary>
+    /// <remarks>
+    /// This service is designed to centralize all CSC API interactions and provide a clean,
+    /// strongly-typed interface for retrieving location data, with standardized exception handling.
+    /// </remarks>
+    public class CSCLoader
+    {
+        private readonly JsonSerializerOptions _jsonOptions;
+        private readonly string _urlBase;
+        private readonly HttpClient _http;
+        private readonly ILogger<CSCLoader> _logger;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="CSCLoader"/> class with configured dependencies.
+        /// </summary>
+        /// <param name="http">The <see cref="HttpClient"/> used for making API requests.</param>
+        /// <param name="options">The CSC API configuration options.</param>
+        /// <param name="logger">Logger instance for diagnostics and error tracking.</param>
+        /// <exception cref="APIException">
+        /// Thrown when required dependencies are null or configuration options are invalid.
+        /// </exception>
+        public CSCLoader(HttpClient http, IOptions<CSCOptions> options, ILogger<CSCLoader> logger)
+        {
+            var opts = options?.Value ?? throw APIException.BadRequest(
+                "CSC configuration options cannot be null.",
+                nameof(options));
+
+            _logger = logger ?? throw APIException.BadRequest(
+                "Logger instance cannot be null.",
+                nameof(logger));
+
+            _http = http ?? throw APIException.BadRequest(
+                "HttpClient cannot be null.",
+                nameof(http));
+
+            try
+            {
+                // Set JSON deserialization behavior (case-insensitive)
+                _jsonOptions = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+
+                // Build base API URL
+                _urlBase = $"{opts.Endpoint.TrimEnd('/')}/countries";
+
+                // Add API key to all outgoing requests
+                if (!_http.DefaultRequestHeaders.TryAddWithoutValidation("X-CSCAPI-KEY", opts.APIKey))
+                    throw APIException.BadRequest("Failed to add CSC API key to request headers.");
+
+                _http.Timeout = TimeSpan.FromSeconds(15);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to initialize CSC API loader.");
+                throw APIException.Internal("Error initializing CSC API client.", ex.Message, ex);
+            }
+        }
+
+        /// <summary>
+        /// Retrieves a list of all countries from the CSC API.
+        /// </summary>
+        /// <returns>A collection of <see cref="Country"/> objects.</returns>
+        /// <exception cref="APIException">Thrown if the request fails or the response is invalid.</exception>
+        public async Task<ICollection<Country>> GetAllCountriesAsync()
+            => await GetFromApiAsync<Country>(_urlBase);
+
+        /// <summary>
+        /// Retrieves a list of all states for a specified country.
+        /// </summary>
+        /// <param name="countryIso2">The ISO2 code of the country.</param>
+        /// <returns>A collection of <see cref="State"/> objects.</returns>
+        /// <exception cref="APIException">Thrown when <paramref name="countryIso2"/> is invalid or the request fails.</exception>
+        public async Task<ICollection<State>> GetStatesByCountryAsync(string countryIso2)
+        {
+            if (string.IsNullOrWhiteSpace(countryIso2))
+                throw APIException.BadRequest("Country ISO2 code cannot be null or empty.", nameof(countryIso2));
+
+            var result = await GetFromApiAsync<State>($"{_urlBase}/{countryIso2}/states");
+
+            // Enrich data with parent identifier
+            foreach (var s in result)
+                s.CountryIso2 = countryIso2;
+
+            return result;
+        }
+
+        /// <summary>
+        /// Retrieves a list of all cities for a given state within a country.
+        /// </summary>
+        /// <param name="countryIso2">The ISO2 code of the country.</param>
+        /// <param name="stateIso2">The ISO2 code of the state.</param>
+        /// <returns>A collection of <see cref="City"/> objects.</returns>
+        /// <exception cref="APIException">Thrown when parameters are invalid or the request fails.</exception>
+        public async Task<ICollection<City>> GetCitiesByStateAsync(string countryIso2, string stateIso2)
+        {
+            if (string.IsNullOrWhiteSpace(countryIso2))
+                throw APIException.BadRequest("Country ISO2 code cannot be null or empty.", nameof(countryIso2));
+
+            if (string.IsNullOrWhiteSpace(stateIso2))
+                throw APIException.BadRequest("State ISO2 code cannot be null or empty.", nameof(stateIso2));
+
+            var result = await GetFromApiAsync<City>(
+                $"{_urlBase}/{countryIso2}/states/{stateIso2}/cities");
+
+            foreach (var c in result)
+            {
+                c.CountryIso2 = countryIso2;
+                c.StateIso2 = stateIso2;
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Sends an HTTP GET request to the specified CSC API endpoint and deserializes the JSON response.
+        /// </summary>
+        /// <typeparam name="T">The target model type to deserialize.</typeparam>
+        /// <param name="url">The API endpoint to call.</param>
+        /// <returns>A collection of deserialized objects of type <typeparamref name="T"/>.</returns>
+        /// <exception cref="APIException">
+        /// Thrown when the API request fails, times out, or returns invalid JSON data.
+        /// </exception>
+        private async Task<ICollection<T>> GetFromApiAsync<T>(string url)
+        {
+            try
+            {
+                var data = await _http.GetFromJsonAsync<List<T>>(url, _jsonOptions).ConfigureAwait(false);
+                _logger.LogDebug("Fetched {Count} {Type} items from {Url}", data?.Count ?? 0, typeof(T).Name, url);
+                return data ?? new List<T>();
+            }
+            catch (HttpRequestException ex)
+            {
+                _logger.LogError(ex, "HTTP error when calling {Url}", url);
+                throw APIException.Internal($"HTTP request to CSC API failed for {url}", ex.Message, ex);
+            }
+            catch (TaskCanceledException ex)
+            {
+                _logger.LogWarning(ex, "Request timeout for {Url}", url);
+                throw APIException.Internal($"CSC API request timed out for {url}", ex.Message, ex);
+            }
+            catch (NotSupportedException ex)
+            {
+                _logger.LogError(ex, "Unsupported content type received from {Url}", url);
+                throw APIException.Internal($"Invalid or unsupported content received from {url}", ex.Message, ex);
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogError(ex, "Failed to parse CSC API response from {Url}", url);
+                throw APIException.Internal($"Invalid JSON format received from {url}", ex.Message, ex);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unexpected error calling CSC API at {Url}", url);
+                throw APIException.Internal("Unexpected error when fetching data from CSC API.", ex.Message, ex);
+            }
+        }
+    }
+}
+
+
+===== CSCService/CSCOptions.cs =====
+using System.ComponentModel.DataAnnotations;
+using YuGiOh.Domain.Exceptions;
+
+namespace YuGiOh.Infrastructure.CSCService
+{
+    /// <summary>
+    /// Represents configuration settings for the CSC (Card Search/Collector Service) integration.
+    /// This includes API access credentials, endpoint configuration, and caching defaults.
+    /// </summary>
+    public class CSCOptions
+    {
+        /// <summary>
+        /// Gets or sets the API key used to authenticate requests to the CSC service.
+        /// </summary>
+        /// <exception cref="APIException">
+        /// Thrown when the property value is null, empty, or consists only of whitespace.
+        /// </exception>
+        [Required]
+        public required string APIKey
+        {
+            get => _apiKey;
+            set
+            {
+                if (string.IsNullOrWhiteSpace(value))
+                    throw APIException.BadRequest("CSC API key cannot be null or empty.");
+                _apiKey = value;
+            }
+        }
+        private string _apiKey = string.Empty;
+
+        /// <summary>
+        /// Gets or sets the base endpoint URL for the CSC API.
+        /// </summary>
+        /// <exception cref="APIException">
+        /// Thrown when the property value is null, empty, or consists only of whitespace.
+        /// </exception>
+        [Required]
+        public required string Endpoint
+        {
+            get => _endpoint;
+            set
+            {
+                if (string.IsNullOrWhiteSpace(value))
+                    throw APIException.BadRequest("CSC API endpoint cannot be null or empty.");
+                _endpoint = value;
+            }
+        }
+        private string _endpoint = string.Empty;
+
+        /// <summary>
+        /// Gets or sets the default number of hours to cache CSC API responses.
+        /// Defaults to 4 hours.
+        /// </summary>
+        /// <exception cref="APIException">
+        /// Thrown when an invalid (negative or zero) cache duration is assigned.
+        /// </exception>
+        public double DefaultCacheHours
+        {
+            get => _defaultCacheHours;
+            set
+            {
+                if (value <= 0)
+                    throw APIException.BadRequest("Default cache duration must be greater than zero hours.");
+                _defaultCacheHours = value;
+            }
+        }
+        private double _defaultCacheHours = 4;
+    }
+}
+
+
+===== CSCService/CSCProvider.cs =====
+using YuGiOh.Domain.DTOs;
+using YuGiOh.Domain.Models;
+using YuGiOh.Domain.Services;
+using YuGiOh.Domain.Repositories;
+using Microsoft.Extensions.Options;
+using Ardalis.Specification;
+using YuGiOh.Domain.Exceptions;
+
+namespace YuGiOh.Infrastructure.CSCService
+{
+    /// <summary>
+    /// Provides a unified interface for accessing CSC (Country-State-City) data,
+    /// combining remote API calls with caching and local data persistence for performance and resilience.
+    /// </summary>
+    public class CSCProvider : ICSCProvider
+    {
+        private readonly CSCLoader _loader;
+        private readonly ICachingRepository _cache;
+        private readonly IReadRepositoryBase<StreetType> _streetTypeRepository;
+        private readonly TimeSpan _ttl;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="CSCProvider"/> class.
+        /// </summary>
+        /// <param name="cache">Caching repository instance used to cache API responses.</param>
+        /// <param name="loader">The service responsible for making CSC API requests.</param>
+        /// <param name="streetTypeRepository">Repository for reading street type data from the database.</param>
+        /// <param name="options">Configuration options defining caching TTL and API behavior.</param>
+        /// <exception cref="APIException">
+        /// Thrown when any dependency is null or configuration options are invalid.
+        /// </exception>
+        public CSCProvider(
+            ICachingRepository cache,
+            CSCLoader loader,
+            IReadRepositoryBase<StreetType> streetTypeRepository,
+            IOptions<CSCOptions> options)
+        {
+            _cache = cache ?? throw APIException.BadRequest("Caching repository cannot be null.", nameof(cache));
+            _loader = loader ?? throw APIException.BadRequest("CSC API loader cannot be null.", nameof(loader));
+            _streetTypeRepository = streetTypeRepository ?? throw APIException.BadRequest("StreetType repository cannot be null.", nameof(streetTypeRepository));
+
+            var opts = options?.Value ?? throw APIException.BadRequest("CSC configuration options cannot be null.", nameof(options));
+
+            if (opts.DefaultCacheHours <= 0)
+                throw APIException.BadRequest("Default cache duration must be greater than zero hours.");
+
+            _ttl = TimeSpan.FromHours(opts.DefaultCacheHours);
+        }
+
+        /// <summary>
+        /// Retrieves and caches the list of all countries from the CSC API.
+        /// </summary>
+        /// <returns>A cached collection of <see cref="Country"/> objects.</returns>
+        public Task<ICollection<Country>> GetAllCountriesAsync()
+            => _cache.GroupQuery(
+                c => true,
+                _loader.GetAllCountriesAsync,
+                _ttl,
+                "countries");
+
+        /// <summary>
+        /// Retrieves and caches all states for a specified country.
+        /// </summary>
+        /// <param name="countryIso2">The ISO2 code of the target country.</param>
+        /// <returns>A cached collection of <see cref="State"/> objects for that country.</returns>
+        /// <exception cref="APIException">Thrown when <paramref name="countryIso2"/> is null or empty.</exception>
+        public Task<ICollection<State>> GetStatesByCountryAsync(string countryIso2)
+        {
+            if (string.IsNullOrWhiteSpace(countryIso2))
+                throw APIException.BadRequest("Country ISO2 code cannot be null or empty.", nameof(countryIso2));
+
+            return _cache.GroupQuery(
+                s => true,
+                () => _loader.GetStatesByCountryAsync(countryIso2),
+                _ttl,
+                $"states:{countryIso2}");
+        }
+
+        /// <summary>
+        /// Retrieves and caches all cities for a given state within a country.
+        /// </summary>
+        /// <param name="countryIso2">The ISO2 code of the country.</param>
+        /// <param name="stateIso2">The ISO2 code of the state.</param>
+        /// <returns>A cached collection of <see cref="City"/> objects.</returns>
+        /// <exception cref="APIException">
+        /// Thrown when <paramref name="countryIso2"/> or <paramref name="stateIso2"/> is null or empty.
+        /// </exception>
+        public Task<ICollection<City>> GetCitiesByStateAsync(string countryIso2, string stateIso2)
+        {
+            if (string.IsNullOrWhiteSpace(countryIso2))
+                throw APIException.BadRequest("Country ISO2 code cannot be null or empty.", nameof(countryIso2));
+
+            if (string.IsNullOrWhiteSpace(stateIso2))
+                throw APIException.BadRequest("State ISO2 code cannot be null or empty.", nameof(stateIso2));
+
+            return _cache.GroupQuery(
+                c => true,
+                () => _loader.GetCitiesByStateAsync(countryIso2, stateIso2),
+                _ttl,
+                $"cities:{countryIso2}:{stateIso2}");
+        }
+
+        /// <summary>
+        /// Retrieves and caches the list of valid street types from the database.
+        /// </summary>
+        /// <returns>A cached collection of <see cref="StreetType"/> records.</returns>
+        public async Task<ICollection<StreetType>> GetStreetTypesAsync()
+        {
+            return await _cache.GroupQuery<StreetType>(
+                s => true,
+                async () => await _streetTypeRepository.ListAsync(),
+                _ttl,
+                "streettypes");
+        }
+    }
+}
+
+
+===== CSCService/ServiceExtension.cs =====
+using YuGiOh.Domain.Services;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+using YuGiOh.Domain.Exceptions;
+
+namespace YuGiOh.Infrastructure.CSCService
+{
+    /// <summary>
+    /// Provides service registration extensions for integrating the CSC (Country-State-City)
+    /// API into the dependency injection container.
+    /// </summary>
+    public static class ServiceExtension
+    {
+        /// <summary>
+        /// Registers the CSC API client and related provider services within the dependency injection system.
+        /// </summary>
+        /// <param name="services">The dependency injection service collection.</param>
+        /// <param name="configuration">The application configuration instance.</param>
+        /// <returns>The updated <see cref="IServiceCollection"/> instance.</returns>
+        /// <exception cref="APIException">
+        /// Thrown if the configuration or required CSC options are missing or invalid.
+        /// </exception>
+        public static IServiceCollection AddCSCService(this IServiceCollection services, IConfiguration configuration)
+        {
+            if (services == null)
+                throw APIException.BadRequest("Service collection cannot be null.", nameof(services));
+
+            if (configuration == null)
+                throw APIException.BadRequest("Configuration instance cannot be null.", nameof(configuration));
+
+            // Bind and validate CSC configuration options
+            services.Configure<CSCOptions>(configuration.GetSection("CSCOptions"));
+
+            // Configure the HttpClient for CSC API with automatic key and base URL setup
+            services.AddHttpClient<CSCLoader>((sp, client) =>
+            {
+                try
+                {
+                    var opts = sp.GetRequiredService<IOptions<CSCOptions>>().Value;
+
+                    if (string.IsNullOrWhiteSpace(opts.Endpoint))
+                        throw APIException.BadRequest("CSC API endpoint cannot be null or empty.");
+
+                    if (string.IsNullOrWhiteSpace(opts.APIKey))
+                        throw APIException.BadRequest("CSC API key cannot be null or empty.");
+
+                    client.BaseAddress = new Uri(opts.Endpoint.TrimEnd('/') + "/");
+
+                    if (!client.DefaultRequestHeaders.TryAddWithoutValidation("X-CSCAPI-KEY", opts.APIKey))
+                        throw APIException.Internal("Failed to add CSC API key to request headers.");
+                }
+                catch (APIException)
+                {
+                    // Forward structured exceptions unchanged
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    throw APIException.Internal(
+                        "Unexpected error occurred while configuring CSC HttpClient.",
+                        ex.Message,
+                        ex);
+                }
+            });
+
+            // Register the CSCProvider as a scoped service
+            services.AddScoped<ICSCProvider, CSCProvider>();
+
+            return services;
+        }
+    }
+}
+
+
+===== EmailService/EmailProviderRegistration.cs =====
+using YuGiOh.Domain.DTOs;
+using YuGiOh.Domain.Services;
+using YuGiOh.Domain.Exceptions;
+
+namespace YuGiOh.Infrastructure.EmailService
+{
+    /// <summary>
+    /// Provides functionality for generating email messages related to user account operations,
+    /// such as registration confirmation.
+    /// </summary>
+    public partial class EmailProvider : IEmailProvider
+    {
+        /// <summary>
+        /// Generates a formatted email message for confirming user registration.
+        /// </summary>
+        /// <param name="email">The recipient's email address.</param>
+        /// <param name="callbackURL">The confirmation link to verify the user’s account.</param>
+        /// <returns>
+        /// A populated <see cref="EmailMessageDTO"/> containing both HTML and plain text representations
+        /// of the registration confirmation email.
+        /// </returns>
+        /// <exception cref="APIException">
+        /// Thrown when the <paramref name="email"/> or <paramref name="callbackURL"/> is null or invalid.
+        /// </exception>
+        public EmailMessageDTO GenerateConfirmRegistrationEmail(string email, string callbackURL)
+        {
+            if (string.IsNullOrWhiteSpace(email))
+                throw APIException.BadRequest("Recipient email address cannot be null or empty.", nameof(email));
+
+            if (string.IsNullOrWhiteSpace(callbackURL))
+                throw APIException.BadRequest("Callback URL cannot be null or empty.", nameof(callbackURL));
+
+            // Construct the confirmation email with both HTML and plaintext versions
+            return new EmailMessageDTO
+            {
+                ToAddress = email,
+                Subject = "Confirm Your Registration - Yu-Gi-Oh!",
+                Body = $@"
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+    <meta charset='UTF-8'>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            background-color: #f7f5fa;
+            color: #333;
+            margin: 0;
+            padding: 0;
+        }}
+        .container {{
+            max-width: 600px;
+            margin: 20px auto;
+            background: white;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+        }}
+        .header {{
+            background: linear-gradient(135deg, #6a0dad, #9b30ff);
+            color: white;
+            text-align: center;
+            padding: 20px;
+        }}
+        .header h1 {{
+            margin: 0;
+            font-size: 24px;
+        }}
+        .content {{
+            padding: 20px;
+            font-size: 16px;
+            line-height: 1.6;
+        }}
+        .btn {{
+            display: inline-block;
+            margin: 20px 0;
+            padding: 12px 20px;
+            background: #6a0dad;
+            color: white !important;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: bold;
+        }}
+        .btn:hover {{
+            background: #8a2be2;
+        }}
+        .footer {{
+            text-align: center;
+            font-size: 12px;
+            color: #777;
+            padding: 15px;
+            border-top: 1px solid #eee;
+        }}
+    </style>
+</head>
+<body>
+    <div class='container'>
+        <div class='header'>
+            <h1>Welcome to Yu-Gi-Oh!</h1>
+        </div>
+        <div class='content'>
+            <p>Hi Duelist,</p>
+            <p>Thank you for registering with <strong>Yu-Gi-Oh! Tournament System</strong>.</p>
+            <p>To complete your registration, please confirm your email address by clicking the button below:</p>
+            <p style='text-align:center;'>
+                <a href='{callbackURL}' class='btn'>Confirm My Email</a>
+            </p>
+            <p>If you didn’t request this, you can safely ignore this email.</p>
+        </div>
+        <div class='footer'>
+            © {DateTime.UtcNow.Year} Yu-Gi-Oh! Tournament System
+        </div>
+    </div>
+</body>
+</html>",
+                IsHTML = true,
+                PlainTextBody = $@"
+Welcome to Yu-Gi-Oh! Tournament System
+
+Thank you for registering.
+To complete your registration, confirm your email by visiting this link:
+
+{callbackURL}
+
+If you did not request this, please ignore this message.
+"
+            };
+        }
+    }
+}
+
+
+===== EmailService/EmailSender.cs =====
+using YuGiOh.Domain.DTOs;
+using YuGiOh.Domain.Services;
+using YuGiOh.Domain.Exceptions;
+
+using MimeKit;
+using MailKit.Net.Smtp;
+using MailKit.Security;
+using Microsoft.Extensions.Options;
+
+namespace YuGiOh.Infrastructure.EmailService
+{
+    /// <summary>
+    /// Provides functionality to send emails using SMTP (Simple Mail Transfer Protocol)
+    /// through the MailKit library.
+    /// </summary>
+    public class EmailSender : IEmailSender
+    {
+        private readonly SMTPOptions _smtpOptions;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="EmailSender"/> class.
+        /// </summary>
+        /// <param name="options">The configured SMTP options for connecting to the mail server.</param>
+        /// <exception cref="APIException">Thrown when SMTP configuration is null or invalid.</exception>
+        public EmailSender(IOptions<SMTPOptions> options)
+        {
+            if (options?.Value == null)
+                throw APIException.Internal("SMTP configuration options cannot be null.");
+
+            _smtpOptions = options.Value;
+
+            // Basic validation
+            if (string.IsNullOrWhiteSpace(_smtpOptions.Server))
+                throw APIException.BadRequest("SMTP server cannot be null or empty.");
+
+            if (_smtpOptions.Port <= 0)
+                throw APIException.BadRequest("SMTP port must be greater than zero.");
+
+            if (string.IsNullOrWhiteSpace(_smtpOptions.Username))
+                throw APIException.BadRequest("SMTP username cannot be null or empty.");
+
+            if (string.IsNullOrWhiteSpace(_smtpOptions.Password))
+                throw APIException.BadRequest("SMTP password cannot be null or empty.");
+
+            if (string.IsNullOrWhiteSpace(_smtpOptions.FromDisplayName))
+                throw APIException.BadRequest("SMTP display name cannot be null or empty.");
+
+            if (string.IsNullOrWhiteSpace(_smtpOptions.FromAddress))
+                throw APIException.BadRequest("SMTP sender address cannot be null or empty.");
+        }
+
+        /// <summary>
+        /// Sends an individual email asynchronously using the configured SMTP server.
+        /// </summary>
+        /// <param name="emailData">The email message content to be sent.</param>
+        /// <exception cref="APIException">
+        /// Thrown when the email data is invalid or when sending fails due to SMTP errors.
+        /// </exception>
+        public async Task SendMailAsync(EmailMessageDTO emailData)
+        {
+            if (emailData == null)
+                throw APIException.BadRequest("Email data cannot be null.");
+
+            if (string.IsNullOrWhiteSpace(emailData.ToAddress))
+                throw APIException.BadRequest("Recipient address cannot be null or empty.");
+
+            if (string.IsNullOrWhiteSpace(emailData.Subject))
+                throw APIException.BadRequest("Email subject cannot be null or empty.");
+
+            var email = BuildMimeMessage(emailData);
+
+            try
+            {
+                using var smtp = new SmtpClient();
+                await smtp.ConnectAsync(_smtpOptions.Server, _smtpOptions.Port, SecureSocketOptions.StartTls);
+                await smtp.AuthenticateAsync(_smtpOptions.Username, _smtpOptions.Password);
+                await smtp.SendAsync(email);
+                await smtp.DisconnectAsync(true);
+            }
+            catch (SmtpCommandException ex)
+            {
+                throw APIException.Internal(
+                    $"SMTP command error while sending email: {ex.Message}",
+                    detail: $"StatusCode: {ex.StatusCode}",
+                    innerException: ex);
+            }
+            catch (SmtpProtocolException ex)
+            {
+                throw APIException.Internal("SMTP protocol error while sending email.", ex.Message, ex);
+            }
+            catch (Exception ex)
+            {
+                throw APIException.Internal("Unexpected error occurred while sending email.", ex.Message, ex);
+            }
+        }
+
+        /// <summary>
+        /// Sends multiple emails efficiently by reusing a single SMTP connection.
+        /// </summary>
+        /// <param name="emailBatch">A collection of email messages to send.</param>
+        /// <returns>A task representing the asynchronous operation.</returns>
+        /// <exception cref="APIException">
+        /// Thrown when the input collection is invalid or SMTP transmission fails.
+        /// </exception>
+        public async Task SendBulkMailAsync(IEnumerable<EmailMessageDTO> emailBatch)
+        {
+            if (emailBatch == null)
+                throw APIException.BadRequest("Email batch cannot be null.");
+
+            var emails = emailBatch.ToList();
+            if (emails.Count == 0)
+                throw APIException.BadRequest("Email batch cannot be empty.");
+
+            using var smtp = new SmtpClient();
+            try
+            {
+                await smtp.ConnectAsync(_smtpOptions.Server, _smtpOptions.Port, SecureSocketOptions.StartTls);
+                await smtp.AuthenticateAsync(_smtpOptions.Username, _smtpOptions.Password);
+
+                foreach (var emailData in emails)
+                {
+                    try
+                    {
+                        if (emailData == null || string.IsNullOrWhiteSpace(emailData.ToAddress))
+                            continue; // Skip invalid entries instead of stopping the batch
+
+                        var email = BuildMimeMessage(emailData);
+                        await smtp.SendAsync(email);
+                    }
+                    catch (SmtpCommandException ex)
+                    {
+                        // Continue sending remaining emails even if one fails
+                        throw APIException.Internal(
+                            $"SMTP command error while sending email to {emailData?.ToAddress}.",
+                            detail: ex.Message,
+                            innerException: ex);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Log or handle as needed — we don’t stop the batch
+                        throw APIException.Internal(
+                            $"Unexpected error while sending email to {emailData?.ToAddress}.",
+                            ex.Message,
+                            ex);
+                    }
+                }
+
+                await smtp.DisconnectAsync(true);
+            }
+            catch (Exception ex)
+            {
+                throw APIException.Internal("Error during bulk email sending session.", ex.Message, ex);
+            }
+        }
+
+        /// <summary>
+        /// Builds a properly formatted <see cref="MimeMessage"/> from an <see cref="EmailMessageDTO"/>.
+        /// </summary>
+        private MimeMessage BuildMimeMessage(EmailMessageDTO emailData)
+        {
+            var email = new MimeMessage();
+            email.From.Add(new MailboxAddress(_smtpOptions.FromDisplayName, _smtpOptions.FromAddress));
+            email.To.Add(MailboxAddress.Parse(emailData.ToAddress));
+            email.Subject = emailData.Subject;
+
+            if (emailData.IsHTML)
+            {
+                var builder = new BodyBuilder
+                {
+                    HtmlBody = emailData.Body,
+                    TextBody = emailData.PlainTextBody ?? string.Empty
+                };
+                email.Body = builder.ToMessageBody();
+            }
+            else
+            {
+                email.Body = new TextPart("plain")
+                {
+                    Text = emailData.Body ?? string.Empty
+                };
+            }
+
+            return email;
+        }
+    }
+}
+
+
+===== EmailService/ServiceExtension.cs =====
+using YuGiOh.Domain.Services;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using YuGiOh.Domain.Exceptions;
+
+namespace YuGiOh.Infrastructure.EmailService
+{
+    /// <summary>
+    /// Provides extension methods for registering the email service components
+    /// (SMTP sender and provider) into the dependency injection container.
+    /// </summary>
+    public static class ServiceExtension
+    {
+        /// <summary>
+        /// Registers the email sending and templating services into the dependency injection system.
+        /// </summary>
+        /// <param name="services">The dependency injection service collection.</param>
+        /// <param name="configuration">The application configuration source.</param>
+        /// <returns>The updated <see cref="IServiceCollection"/> instance.</returns>
+        /// <exception cref="APIException">
+        /// Thrown if <paramref name="services"/> or <paramref name="configuration"/> is null.
+        /// </exception>
+        public static IServiceCollection AddEmailService(this IServiceCollection services, IConfiguration configuration)
+        {
+            if (services == null)
+                throw APIException.BadRequest("Service collection cannot be null.", nameof(services));
+
+            if (configuration == null)
+                throw APIException.BadRequest("Configuration instance cannot be null.", nameof(configuration));
+
+            // Binds SMTP options from configuration and ensures they are available
+            services.AddOptions<SMTPOptions>()
+                    .Bind(configuration.GetSection("SMTPOptions"))
+                    .ValidateDataAnnotations()   // optional, triggers [Required] attributes if added
+                    .ValidateOnStart();          // fail early if SMTP configuration is invalid
+
+            // Registers the core email infrastructure components
+            services.AddScoped<IEmailSender, EmailSender>();
+            services.AddScoped<IEmailProvider, EmailProvider>();
+
+            return services;
+        }
+    }
+}
+
+
+===== EmailService/SMTPOptions.cs =====
+using YuGiOh.Domain.Exceptions;
+
+namespace YuGiOh.Infrastructure.EmailService
+{
+    /// <summary>
+    /// Represents configuration options for SMTP (Simple Mail Transfer Protocol)
+    /// used by the email sending service.
+    /// </summary>
+    /// <remarks>
+    /// This configuration class defines connection parameters and sender information
+    /// for outgoing emails. It should be bound from the application's configuration (e.g. appsettings.json)
+    /// under a section such as <c>"SMTPOptions"</c>.
+    /// </remarks>
+    public class SMTPOptions
+    {
+        private string _server = string.Empty;
+        private int _port;
+        private string _username = string.Empty;
+        private string _password = string.Empty;
+        private string _fromAddress = string.Empty;
+        private string _fromDisplayName = string.Empty;
+
+        /// <summary>
+        /// Gets or sets the SMTP server host name or IP address.
+        /// </summary>
+        /// <exception cref="APIException">Thrown when the value is null or whitespace.</exception>
+        public required string Server
+        {
+            get => _server;
+            set
+            {
+                if (string.IsNullOrWhiteSpace(value))
+                    throw APIException.BadRequest("SMTP server address cannot be null or empty.");
+                _server = value;
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the SMTP server port number (e.g., 25, 465, 587).
+        /// </summary>
+        /// <exception cref="APIException">Thrown when the port is zero or negative.</exception>
+        public required int Port
+        {
+            get => _port;
+            set
+            {
+                if (value <= 0)
+                    throw APIException.BadRequest("SMTP port must be greater than zero.");
+                _port = value;
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the username used to authenticate with the SMTP server.
+        /// </summary>
+        /// <exception cref="APIException">Thrown when the value is null or whitespace.</exception>
+        public required string Username
+        {
+            get => _username;
+            set
+            {
+                if (string.IsNullOrWhiteSpace(value))
+                    throw APIException.BadRequest("SMTP username cannot be null or empty.");
+                _username = value;
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the password used to authenticate with the SMTP server.
+        /// </summary>
+        /// <exception cref="APIException">Thrown when the value is null or whitespace.</exception>
+        public required string Password
+        {
+            get => _password;
+            set
+            {
+                if (string.IsNullOrWhiteSpace(value))
+                    throw APIException.BadRequest("SMTP password cannot be null or empty.");
+                _password = value;
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the default email address to use as the sender for outgoing emails.
+        /// </summary>
+        /// <exception cref="APIException">Thrown when the value is null or whitespace.</exception>
+        public required string FromAddress
+        {
+            get => _fromAddress;
+            set
+            {
+                if (string.IsNullOrWhiteSpace(value))
+                    throw APIException.BadRequest("SMTP sender address cannot be null or empty.");
+                _fromAddress = value;
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the friendly display name to appear as the sender of outgoing emails.
+        /// </summary>
+        /// <exception cref="APIException">Thrown when the value is null or whitespace.</exception>
+        public required string FromDisplayName
+        {
+            get => _fromDisplayName;
+            set
+            {
+                if (string.IsNullOrWhiteSpace(value))
+                    throw APIException.BadRequest("SMTP sender display name cannot be null or empty.");
+                _fromDisplayName = value;
+            }
+        }
+    }
+}
+
+
+===== Identity/Account.cs =====
+using Microsoft.AspNetCore.Identity;
+
+namespace YuGiOh.Infrastructure.Identity
+{
+    /// <summary>
+    /// Represents an application user account managed by ASP.NET Core Identity.
+    /// Extends the default <see cref="IdentityUser"/> with additional metadata.
+    /// </summary>
+    public class Account : IdentityUser
+    {
+        /// <summary>
+        /// Gets or sets the UTC timestamp when the account was created.
+        /// </summary>
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="Account"/> class.
+        /// </summary>
+        public Account() : base() { }
+    }
+}
+
+
+===== Identity/JWTOptions.cs =====
+using System.ComponentModel.DataAnnotations;
+
+namespace YuGiOh.Infrastructure.Identity
+{
+    /// <summary>
+    /// Represents configuration settings for JSON Web Token (JWT) authentication.
+    /// </summary>
+    /// <remarks>
+    /// These values should be loaded from configuration (e.g. <c>appsettings.json</c>)
+    /// under the <c>JWT</c> section and validated.
+    /// </remarks>
+    public class JWTOptions
+    {
+        /// <summary>
+        /// Secret key used to sign and validate JWT tokens.
+        /// Must be at least 32 characters long for HMAC-SHA256 security.
+        /// </summary>
+        [Required]
+        [MinLength(32, ErrorMessage = "SecretKey should be at least 32 characters for security.")]
+        public required string SecretKey { get; set; }
+
+        /// <summary>
+        /// Token issuer — typically application name or domain.
+        /// </summary>
+        [Required]
+        public required string Issuer { get; set; }
+
+        /// <summary>
+        /// Token audience — identifies valid token consumers (e.g. client apps).
+        /// </summary>
+        [Required]
+        public required string Audience { get; set; }
+
+        /// <summary>
+        /// Duration in minutes before an access token expires.
+        /// </summary>
+        [Range(1, int.MaxValue, ErrorMessage = "AccessTokenExpirationMinutes must be greater than 0.")]
+        public int AccessTokenExpirationMinutes { get; set; }
+
+        /// <summary>
+        /// Duration in days before a refresh token expires.
+        /// </summary>
+        [Range(1, int.MaxValue, ErrorMessage = "RefreshTokenExpirationDays must be greater than 0.")]
+        public int RefreshTokenExpirationDays { get; set; }
+    }
+}
+
+
+===== Identity/ServiceExtension.cs =====
+using System.Text;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.IdentityModel.Tokens;
+using Newtonsoft.Json;
+
+using YuGiOh.Domain.Services;
+using YuGiOh.Domain.Exceptions;
+using YuGiOh.Infrastructure.Identity.Services;
+using YuGiOh.Infrastructure.Persistence;
+
+namespace YuGiOh.Infrastructure.Identity
+{
+    /// <summary>
+    /// Provides extension methods for configuring identity, authentication, and authorization services
+    /// within the dependency injection container.
+    /// </summary>
+    public static class ServiceExtension
+    {
+        /// <summary>
+        /// Registers and configures ASP.NET Core Identity, JWT authentication,
+        /// and related identity services for the Yu-Gi-Oh! application.
+        /// </summary>
+        /// <param name="services">The dependency injection service collection.</param>
+        /// <param name="configuration">The application configuration source.</param>
+        /// <returns>The updated <see cref="IServiceCollection"/> instance.</returns>
+        /// <exception cref="APIException">
+        /// Thrown when the service collection, configuration, or JWT settings are invalid.
+        /// </exception>
+        public static IServiceCollection AddIdentityService(this IServiceCollection services, IConfiguration configuration)
+        {
+            if (services == null)
+                throw APIException.BadRequest("Service collection cannot be null.", nameof(services));
+
+            if (configuration == null)
+                throw APIException.BadRequest("Configuration instance cannot be null.", nameof(configuration));
+
+            // === Identity Core Setup ===
+            services
+                .AddIdentity<Account, IdentityRole>(options =>
+                {
+                    // User settings
+                    options.User.AllowedUserNameCharacters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._@+";
+                    options.User.RequireUniqueEmail = true;
+
+                    // Sign-in settings
+                    options.SignIn.RequireConfirmedEmail = true;
+
+                    // Password policy
+                    options.Password.RequireDigit = true;
+                    options.Password.RequireLowercase = true;
+                    options.Password.RequireUppercase = true;
+                    options.Password.RequireNonAlphanumeric = true;
+                    options.Password.RequiredLength = 8;
+
+                    // Lockout policy
+                    options.Lockout.MaxFailedAccessAttempts = 5;
+                    options.Lockout.DefaultLockoutTimeSpan = TimeSpan.FromMinutes(15);
+                    options.Lockout.AllowedForNewUsers = true;
+                })
+                .AddEntityFrameworkStores<YuGiOhDbContext>()
+                .AddDefaultTokenProviders();
+
+            // === JWT Authentication Setup ===
+            services.Configure<JWTOptions>(configuration.GetSection("JWTOptions"));
+            var jwtOptions = configuration.GetSection("JWTOptions").Get<JWTOptions>();
+
+            if (jwtOptions == null)
+                throw APIException.BadRequest("JWTOptions section is missing or misconfigured.");
+
+            if (string.IsNullOrWhiteSpace(jwtOptions.SecretKey))
+                throw APIException.BadRequest("JWT SecretKey cannot be null or empty.");
+
+            if (jwtOptions.SecretKey.Length < 32)
+                throw APIException.BadRequest("JWT SecretKey must be at least 32 characters long for sufficient cryptographic strength.");
+
+            if (string.IsNullOrWhiteSpace(jwtOptions.Issuer))
+                throw APIException.BadRequest("JWT Issuer cannot be null or empty.");
+
+            if (string.IsNullOrWhiteSpace(jwtOptions.Audience))
+                throw APIException.BadRequest("JWT Audience cannot be null or empty.");
+
+            services.AddAuthentication(options =>
+            {
+                options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+                options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+            })
+            .AddJwtBearer(o =>
+            {
+                o.RequireHttpsMetadata = true; // enforce HTTPS
+                o.SaveToken = true;
+
+                o.TokenValidationParameters = new TokenValidationParameters
+                {
+                    ValidateIssuerSigningKey = true,
+                    ValidateIssuer = true,
+                    ValidateAudience = true,
+                    ValidateLifetime = true,
+                    ClockSkew = TimeSpan.FromMinutes(1),
+                    ValidIssuer = jwtOptions.Issuer,
+                    ValidAudience = jwtOptions.Audience,
+                    IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtOptions.SecretKey))
+                };
+
+                // Custom JWT failure responses
+                o.Events = new JwtBearerEvents()
+                {
+                    OnAuthenticationFailed = context =>
+                    {
+                        context.NoResult();
+                        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                        context.Response.ContentType = "application/json";
+                        var result = JsonConvert.SerializeObject(new
+                        {
+                            error = "Authentication failed",
+                            details = context.Exception.Message
+                        });
+                        return context.Response.WriteAsync(result);
+                    },
+                    OnChallenge = context =>
+                    {
+                        context.HandleResponse();
+                        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                        context.Response.ContentType = "application/json";
+                        var result = JsonConvert.SerializeObject(new
+                        {
+                            error = "Unauthorized",
+                            message = "You must be logged in to access this resource."
+                        });
+                        return context.Response.WriteAsync(result);
+                    },
+                    OnForbidden = context =>
+                    {
+                        context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                        context.Response.ContentType = "application/json";
+                        var result = JsonConvert.SerializeObject(new
+                        {
+                            error = "Forbidden",
+                            message = "You do not have access to this resource."
+                        });
+                        return context.Response.WriteAsync(result);
+                    }
+                };
+            });
+
+            // === Custom Identity Services ===
+            services.AddScoped<RolesSpecificEntitiesManager>();
+            services.AddScoped<IAccountTokensProvider, AccountTokensProvider>();
+            services.AddScoped<IRegisterHandler, RegisterHandler>();
+            services.AddScoped<IAuthenticationHandler, AuthenticationHandler>();
+
+            return services;
+        }
+    }
+}
+
+
+===== Identity/Services/AccountTokensProvider.cs =====
+using System.Security.Claims;
+using System.Security.Cryptography;
+using System.Text;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.Extensions.Options;
+using Microsoft.IdentityModel.Tokens;
+using System.IdentityModel.Tokens.Jwt;
+using Ardalis.Specification;
+using YuGiOh.Domain.Models;
+using YuGiOh.Domain.Services;
+using YuGiOh.Domain.Exceptions;
+using System.Net;
+
+namespace YuGiOh.Infrastructure.Identity.Services
+{
+    /// <summary>
+    /// Provides functionality for generating, refreshing, and revoking
+    /// authentication tokens for application accounts.
+    /// </summary>
+    public class AccountTokensProvider : IAccountTokensProvider
+    {
+        private readonly IRepositoryBase<RefreshTokenData> _refreshTokenDataRepository;
+        private readonly UserManager<Account> _userManager;
+        private readonly JWTOptions _jwtOptions;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="AccountTokensProvider"/> class.
+        /// </summary>
+        public AccountTokensProvider(
+            UserManager<Account> userManager,
+            IOptions<JWTOptions> jwtOptions,
+            IRepositoryBase<RefreshTokenData> refreshTokenDataRepository)
+        {
+            _userManager = userManager ?? throw new ArgumentNullException(nameof(userManager));
+            _jwtOptions = jwtOptions?.Value ?? throw new ArgumentNullException(nameof(jwtOptions));
+            _refreshTokenDataRepository = refreshTokenDataRepository ?? throw new ArgumentNullException(nameof(refreshTokenDataRepository));
+        }
+
+        /// <inheritdoc/>
+        public async Task<string> GenerateJWTokenAsync(string accountId)
+        {
+            if (string.IsNullOrWhiteSpace(accountId))
+                throw new APIException(HttpStatusCode.BadRequest, "Account ID cannot be null or empty.");
+
+            var account = await _userManager.FindByIdAsync(accountId)
+                ?? throw new APIException(HttpStatusCode.NotFound, $"No account found for Id: {accountId}");
+            var relatedRoles = await _userManager.GetRolesAsync(account);
+
+            var authClaims = new List<Claim>
+            {
+                new(JwtRegisteredClaimNames.Sub, account.Id),
+                new(JwtRegisteredClaimNames.Email, account.Email ?? string.Empty),
+                new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
+            };
+
+            // Add roles as separate claims for ASP.NET Core's role-based authorization
+            foreach (var role in relatedRoles)
+                authClaims.Add(new Claim(ClaimTypes.Role, role));
+
+            var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_jwtOptions.SecretKey));
+            var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+            var token = new JwtSecurityToken(
+                issuer: _jwtOptions.Issuer,
+                audience: _jwtOptions.Audience,
+                expires: DateTime.UtcNow.AddMinutes(_jwtOptions.AccessTokenExpirationMinutes),
+                claims: authClaims,
+                signingCredentials: credentials
+            );
+
+            return new JwtSecurityTokenHandler().WriteToken(token);
+        }
+
+        /// <inheritdoc/>
+        public async Task<string> AddRefreshTokenAsync(string oldToken, string ipAddress)
+        {
+            if (string.IsNullOrWhiteSpace(oldToken))
+                throw new APIException(HttpStatusCode.BadRequest, "Refresh token cannot be empty.");
+
+            if (string.IsNullOrWhiteSpace(ipAddress))
+                throw new APIException(HttpStatusCode.BadRequest, "IP address is required.");
+
+            var refreshData = await GetRefreshTokenDataAsync(oldToken);
+
+            if (refreshData == null || !refreshData.IsActive)
+                throw new APIException(HttpStatusCode.BadRequest, "Invalid or expired refresh token.");
+
+            if (refreshData.CreatedByIp != ipAddress)
+                throw new APIException(HttpStatusCode.Unauthorized, "Refresh token origin is invalid.");
+
+            var accountId = refreshData.AccountId;
+            await RevokeRefreshTokenAsync(refreshData, ipAddress);
+            return await AddRefreshTokenDataAsync(accountId, ipAddress);
+
+        }
+
+        /// <inheritdoc/>
+        public async Task<string> AddRefreshTokenByIdAsync(string accountId, string ipAddress)
+        {
+            if (string.IsNullOrWhiteSpace(accountId))
+                throw new APIException(HttpStatusCode.BadRequest, "Account ID is required.");
+
+            if (string.IsNullOrWhiteSpace(ipAddress))
+                throw new APIException(HttpStatusCode.BadRequest, "IP address is required.");
+
+            var spec = new RefreshTokenByAccountIdSpec(accountId);
+            var existingToken = await _refreshTokenDataRepository.FirstOrDefaultAsync(spec);
+
+            if (existingToken is { IsActive: true })
+                await RevokeRefreshTokenAsync(existingToken, ipAddress);
+            else if (existingToken != null)
+                await _refreshTokenDataRepository.DeleteAsync(existingToken);
+
+            return await AddRefreshTokenDataAsync(accountId, ipAddress);
+        }
+
+        /// <inheritdoc/>
+        public async Task RevokeRefreshTokenAsync(string token, string ipAddress)
+        {
+            if (string.IsNullOrWhiteSpace(token))
+                throw new APIException(HttpStatusCode.BadRequest, "Refresh token cannot be empty.");
+
+            var refreshData = await GetRefreshTokenDataAsync(token);
+            if (refreshData == null || !refreshData.IsActive)
+                throw new APIException(HttpStatusCode.BadRequest, "Invalid or expired refresh token.");
+            await RevokeRefreshTokenAsync(refreshData, ipAddress);
+        }
+
+        protected async Task RevokeRefreshTokenAsync(RefreshTokenData refreshData, string ipAddress)
+        {
+            refreshData.Revoked = DateTime.UtcNow;
+            refreshData.RevokedByIp = ipAddress;
+
+            await _refreshTokenDataRepository.UpdateAsync(refreshData);
+        }
+
+        private async Task<string> AddRefreshTokenDataAsync(string accountId, string ipAddress)
+        {
+            var randomBytes = new byte[64];
+            using var rng = RandomNumberGenerator.Create();
+            rng.GetBytes(randomBytes);
+
+            var token = Convert.ToBase64String(randomBytes);
+
+            var tokenData = new RefreshTokenData
+            {
+                Token = token,
+                AccountId = accountId,
+                Expires = DateTime.UtcNow.AddDays(_jwtOptions.RefreshTokenExpirationDays),
+                Created = DateTime.UtcNow,
+                CreatedByIp = ipAddress
+            };
+
+            await _refreshTokenDataRepository.AddAsync(tokenData);
+            return token;
+        }
+
+        public async Task<RefreshTokenData?> GetRefreshTokenDataAsync(string token)
+        {
+            if (string.IsNullOrWhiteSpace(token))
+                throw new APIException(HttpStatusCode.BadRequest, "Token cannot be empty.");
+            return await _refreshTokenDataRepository.GetByIdAsync(token);
+        }
+
+        public sealed class RefreshTokenByAccountIdSpec : Specification<RefreshTokenData>
+        {
+            public RefreshTokenByAccountIdSpec(string accountId, bool onlyActive = true)
+            {
+                Query.Where(d => d.AccountId == accountId);
+
+                if (onlyActive)
+                    Query.Where(d => d.Revoked == null && d.Expires > DateTime.UtcNow);
+            }
+        }
+
+    }
+}
+
+
+===== Identity/Services/AuthenticationHandler.cs =====
+using Microsoft.AspNetCore.Identity;
+using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Logging;
+using YuGiOh.Domain.Services;
+using YuGiOh.Domain.Exceptions;
+
+namespace YuGiOh.Infrastructure.Identity.Services
+{
+    /// <summary>
+    /// Handles user authentication and JWT token management.
+    /// Provides secure login and refresh mechanisms with consistent APIException error handling.
+    /// </summary>
+    public class AuthenticationHandler : IAuthenticationHandler
+    {
+        private readonly IAccountTokensProvider _accountTokensProvider;
+        private readonly UserManager<Account> _userManager;
+        private readonly SignInManager<Account> _signInManager;
+        private readonly JWTOptions _jwtOptions;
+        private readonly ILogger<AuthenticationHandler> _logger;
+
+        public AuthenticationHandler(
+            IAccountTokensProvider accountTokensProvider,
+            UserManager<Account> userManager,
+            SignInManager<Account> signInManager,
+            IOptions<JWTOptions> jwtOptions,
+            ILogger<AuthenticationHandler> logger)
+        {
+            _accountTokensProvider = accountTokensProvider ?? throw new ArgumentNullException(nameof(accountTokensProvider));
+            _userManager = userManager ?? throw new ArgumentNullException(nameof(userManager));
+            _signInManager = signInManager ?? throw new ArgumentNullException(nameof(signInManager));
+            _jwtOptions = jwtOptions?.Value ?? throw new ArgumentNullException(nameof(jwtOptions));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        /// <inheritdoc/>
+        /// <summary>
+        /// Authenticates a user and returns a pair of JWT access and refresh tokens.
+        /// </summary>
+        /// <param name="handler">Username or email of the user.</param>
+        /// <param name="password">User's password.</param>
+        /// <param name="ipAddress">Client IP address.</param>
+        /// <returns>A tuple (AccessToken, RefreshToken).</returns>
+        /// <exception cref="APIException">Thrown when input or authentication fails.</exception>
+        public async Task<(string AccessToken, string RefreshToken)> AuthenticateAsync(string handler, string password, string ipAddress)
+        {
+            if (string.IsNullOrWhiteSpace(handler))
+                throw APIException.BadRequest("Username or email is required.");
+            if (string.IsNullOrWhiteSpace(password))
+                throw APIException.BadRequest("Password is required.");
+
+            var account = await GetAccount(handler);
+
+            var result = await _signInManager.CheckPasswordSignInAsync(account, password, lockoutOnFailure: true);
+            if (!result.Succeeded)
+            {
+                _logger.LogWarning("Failed authentication attempt for handler: {Handler}", handler);
+                throw APIException.Unauthorized("Invalid credentials.");
+            }
+
+            try
+            {
+                var accessToken = await _accountTokensProvider.GenerateJWTokenAsync(account.Id);
+                var refreshToken = await _accountTokensProvider.AddRefreshTokenByIdAsync(account.Id, ipAddress);
+
+                _logger.LogInformation("User {UserId} authenticated successfully.", account.Id);
+
+                return (accessToken, refreshToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error generating tokens for user {UserId}", account.Id);
+                throw APIException.Internal("Failed to generate authentication tokens.", ex.Message, ex);
+            }
+        }
+
+        /// <summary>
+        /// Finds an account by username or email and ensures it's confirmed.
+        /// </summary>
+        /// <param name="handler">Username or email string.</param>
+        /// <returns>The user account entity.</returns>
+        /// <exception cref="APIException">Thrown when not found or not confirmed.</exception>
+        private async Task<Account> GetAccount(string handler)
+        {
+            var account = (await _userManager.FindByNameAsync(handler)
+                           ?? await _userManager.FindByEmailAsync(handler));
+
+            if (account == null)
+            {
+                _logger.LogWarning("Account not found for handler: {Handler}", handler);
+                throw APIException.Unauthorized("Invalid credentials.");
+            }
+
+            if (!await _userManager.IsEmailConfirmedAsync(account))
+                throw APIException.Forbidden("Email is not confirmed.");
+
+            // Future account state validation (optional)
+            // if (account.Statement == Domain.Enums.AccountStatement.Deleted)
+            //     throw APIException.Forbidden("Account has been deleted.");
+            //
+            // if (account.Statement == Domain.Enums.AccountStatement.Inactive)
+            //     throw APIException.Forbidden("Account is inactive.");
+
+            return account;
+        }
+
+        /// <inheritdoc/>
+        /// <summary>
+        /// Refreshes an existing token pair using a valid refresh token.
+        /// </summary>
+        /// <param name="refreshToken">Old refresh token.</param>
+        /// <param name="ipAddress">Client IP address.</param>
+        /// <returns>New (AccessToken, RefreshToken) pair.</returns>
+        /// <exception cref="APIException">Thrown for invalid or expired refresh tokens.</exception>
+        public async Task<(string AccessToken, string RefreshToken)> RefreshAsync(string refreshToken, string ipAddress)
+        {
+            if (string.IsNullOrWhiteSpace(refreshToken))
+                throw APIException.BadRequest("Refresh token is required.");
+            if (string.IsNullOrWhiteSpace(ipAddress))
+                throw APIException.BadRequest("IP address is required.");
+
+            try
+            {
+                var newRefreshToken = await _accountTokensProvider.AddRefreshTokenAsync(refreshToken, ipAddress);
+                var refreshData = await _accountTokensProvider.GetRefreshTokenDataAsync(newRefreshToken);
+
+                if (refreshData == null || !refreshData.IsActive)
+                    throw APIException.Unauthorized("Invalid or expired refresh token.");
+
+                var accessToken = await _accountTokensProvider.GenerateJWTokenAsync(refreshData.AccountId);
+
+                _logger.LogInformation("Access token refreshed for account {AccountId}", refreshData.AccountId);
+
+                return (accessToken, newRefreshToken);
+            }
+            catch (APIException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error refreshing authentication tokens.");
+                throw APIException.Internal("Failed to refresh authentication tokens.", ex.Message, ex);
+            }
+        }
+    }
+}
+
+
+===== Identity/Services/RegisterHandler.cs =====
+using System.Net;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+using YuGiOh.Domain.DTOs;
+using YuGiOh.Domain.Exceptions;
+using YuGiOh.Domain.Services;
+using YuGiOh.Infrastructure.Persistence;
+
+namespace YuGiOh.Infrastructure.Identity.Services
+{
+    /// <summary>
+    /// Handles the registration workflow for new user accounts, including
+    /// creation, role assignment, and email confirmation token generation.
+    /// </summary>
+    public class RegisterHandler : IRegisterHandler
+    {
+        private readonly YuGiOhDbContext _dbContext;
+        private readonly UserManager<Account> _userManager;
+        private readonly RoleManager<IdentityRole> _roleManager;
+        private readonly IConfiguration _configuration;
+        private readonly ILogger<RegisterHandler> _logger;
+        private readonly RolesSpecificEntitiesManager _rolesSpecificEntitiesManager;
+
+        public RegisterHandler(
+            YuGiOhDbContext dbContext,
+            UserManager<Account> userManager,
+            RoleManager<IdentityRole> roleManager,
+            IConfiguration configuration,
+            ILogger<RegisterHandler> logger,
+            RolesSpecificEntitiesManager rolesSpecificEntitiesManager)
+        {
+            _dbContext = dbContext ?? throw new ArgumentNullException(nameof(dbContext));
+            _userManager = userManager ?? throw new ArgumentNullException(nameof(userManager));
+            _roleManager = roleManager ?? throw new ArgumentNullException(nameof(roleManager));
+            _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _rolesSpecificEntitiesManager = rolesSpecificEntitiesManager ?? throw new ArgumentNullException(nameof(rolesSpecificEntitiesManager));
+        }
+
+        /// <inheritdoc/>
+        public async Task<string> RegisterUserAsync(RegisterRequestData data)
+        {
+            if (data == null)
+                throw APIException.BadRequest("Argument Null Exception", nameof(data));
+            var strategy = _dbContext.Database.CreateExecutionStrategy();
+
+            return await strategy.ExecuteAsync(async () =>
+            {
+                await using var transaction = await _dbContext.Database.BeginTransactionAsync();
+                try
+                {
+                    ValidateRoleCombination(data);
+                    var account = await CreateAccountAsync(data);
+                    await AddRolesAsync(account, data.Roles);
+
+                    var token = await _userManager.GenerateEmailConfirmationTokenAsync(account);
+
+                    await _rolesSpecificEntitiesManager.AddRelatedEntities(data, account.Id);
+
+                    await transaction.CommitAsync();
+                    return token;
+                }
+                catch (APIException)
+                {
+                    await transaction.RollbackAsync();
+                    throw;
+                }
+                catch (Exception exception)
+                {
+                    await transaction.RollbackAsync();
+                    _logger.LogError(exception, "User registration failed for email {Email}", data.Email);
+                    throw new APIException(innerException: exception);
+                }
+            });
+        }
+
+        private static void ValidateRoleCombination(RegisterRequestData data)
+        {
+            // // === Domain Role Conflict Validation ===
+            // bool hasStaff = data.Roles.Contains("Staff", StringComparer.OrdinalIgnoreCase);
+            // bool hasSponsor = data.Roles.Contains("Sponsor", StringComparer.OrdinalIgnoreCase);
+            // bool hasAdmin = data.Roles.Contains("Admin", StringComparer.OrdinalIgnoreCase);
+
+            // // Rule 1: cannot have Staff and Sponsor together
+            // if (hasStaff && hasSponsor)
+            //     throw APIException.BadRequest(
+            //         "Invalid Role Combination",
+            //         "An account cannot have both Staff and Sponsor roles at the same time.");
+
+            // // Rule 2: Admin with valid IBAN cannot have Staff or Sponsor
+            // // Assuming Account has a property 'IBAN' that may be null or empty.
+            // if (hasAdmin && !string.IsNullOrWhiteSpace(data.IBAN) && (hasStaff || hasSponsor))
+            //     throw APIException.BadRequest(
+            //         "Invalid Role Combination",
+            //         "An Admin account with a valid IBAN cannot have Staff or Sponsor roles.");
+        }
+
+
+        /// <summary>
+        /// Creates the base identity account and persists it to the store.
+        /// </summary>
+        private async Task<Account> CreateAccountAsync(RegisterRequestData request)
+        {
+            if (string.IsNullOrWhiteSpace(request.Email))
+                throw APIException.BadRequest("Argument Exception", "Email is required.");
+            if (string.IsNullOrWhiteSpace(request.Password))
+                throw APIException.BadRequest("Argument Exception", "Password is required.");
+
+            var existing = await _userManager.FindByEmailAsync(request.Email);
+            if (existing != null)
+                throw APIException.BadRequest("Invalid Operation Exception", $"An account with email {request.Email} already exists.");
+
+            var account = new Account
+            {
+                UserName = request.FullName,
+                Email = request.Email
+            };
+
+            var createResult = await _userManager.CreateAsync(account, request.Password);
+            if (!createResult.Succeeded)
+            {
+                var errors = string.Join("; ", createResult.Errors.Select(e => e.Description));
+                _logger.LogWarning("Failed to create account {Email}: {Errors}", request.Email, errors);
+                throw APIException.BadRequest("Invalid Operation Exception", $"Could not create account: {errors}");
+            }
+
+            return account;
+        }
+        /// <summary>
+        /// Assigns the specified roles to the given account,
+        /// ensuring domain rules between Staff, Sponsor, and Admin roles are respected.
+        /// </summary>
+        private async Task AddRolesAsync(Account account, IEnumerable<string> roles)
+        {
+            if (roles == null)
+                throw APIException.BadRequest("Argument Exception", "Roles are required.");
+
+            var toAdd = new List<string>();
+
+            foreach (var roleName in roles.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (!await _roleManager.RoleExistsAsync(roleName))
+                    throw APIException.BadRequest("Invalid Operation Exception", $"Role does not exist: {roleName}.");
+
+                toAdd.Add(roleName);
+            }
+
+            if (!toAdd.Any())
+                throw APIException.BadRequest("Argument Exception", "At least one role is required.");
+
+            // === Proceed with role assignment ===
+            var addResult = await _userManager.AddToRolesAsync(account, toAdd);
+            if (!addResult.Succeeded)
+            {
+                var errors = string.Join("; ", addResult.Errors.Select(e => e.Description));
+                _logger.LogWarning("Failed to assign roles to user {Email}: {Errors}", account.Email, errors);
+                throw APIException.BadRequest("Invalid Operation Exception", $"Not all roles could be assigned: {errors}");
+            }
+        }
+
+
+        /// <inheritdoc/>
+        public async Task<bool> ConfirmRegistrationAsync(string email, string token)
+        {
+            if (string.IsNullOrWhiteSpace(email))
+                throw APIException.BadRequest("Argument Exception", "Email is required.");
+            if (string.IsNullOrWhiteSpace(token))
+                throw APIException.BadRequest("Argument Exception", "Token is required.");
+
+            var user = await _userManager.FindByEmailAsync(email);
+            if (user == null)
+            {
+                _logger.LogWarning("ConfirmEmail: email not found {Email}", email);
+                return false;
+            }
+
+            var result = await _userManager.ConfirmEmailAsync(user, token);
+            if (!result.Succeeded)
+            {
+                _logger.LogWarning("ConfirmEmail failed for {Email}: {Errors}", email, string.Join("; ", result.Errors.Select(e => e.Description)));
+                return false;
+            }
+
+            return true;
+        }
+    }
+}
+
+
+===== Identity/Services/RolesSpecificEntitiesManager.cs =====
+using Ardalis.Specification;
+using Microsoft.Extensions.Logging;
+using YuGiOh.Domain.DTOs;
+using YuGiOh.Domain.Exceptions;
+using YuGiOh.Domain.Models;
+
+namespace YuGiOh.Infrastructure.Identity.Services
+{
+    /// <summary>
+    /// Handles creation of domain-specific related entities for an account
+    /// based on the roles assigned during registration.
+    /// </summary>
+    public class RolesSpecificEntitiesManager
+    {
+        private readonly IRepositoryBase<Address> _addressRepository;
+        private readonly IRepositoryBase<HasIBAN> _ibanRepository;
+        private readonly IRepositoryBase<Player> _playerRepository;
+        private readonly ILogger<RolesSpecificEntitiesManager> _logger;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="RolesSpecificEntitiesManager"/> class.
+        /// </summary>
+        /// <param name="addressRepository">Repository for managing <see cref="Address"/> entities.</param>
+        /// <param name="ibanRepository">Repository for managing <see cref="HasIBAN"/> entities.</param>
+        /// <param name="playerRepository">Repository for managing <see cref="Player"/> entities.</param>
+        /// <param name="logger">Logger instance for diagnostic information.</param>
+        /// <exception cref="APIException">Thrown if any dependency is null.</exception>
+        public RolesSpecificEntitiesManager(
+            IRepositoryBase<Address> addressRepository,
+            IRepositoryBase<HasIBAN> ibanRepository,
+            IRepositoryBase<Player> playerRepository,
+            ILogger<RolesSpecificEntitiesManager> logger)
+        {
+            _addressRepository = addressRepository ?? throw APIException.BadRequest("Address repository cannot be null.", nameof(addressRepository));
+            _ibanRepository = ibanRepository ?? throw APIException.BadRequest("IBAN repository cannot be null.", nameof(ibanRepository));
+            _playerRepository = playerRepository ?? throw APIException.BadRequest("Player repository cannot be null.", nameof(playerRepository));
+            _logger = logger ?? throw APIException.BadRequest("Logger cannot be null.", nameof(logger));
+        }
+
+        /// <summary>
+        /// Adds role-dependent related entities (Address, HasIBAN, Player) after user registration.
+        /// </summary>
+        /// <param name="request">The registration request data containing address, IBAN, and roles.</param>
+        /// <param name="accountId">The ID of the account that was created.</param>
+        /// <exception cref="APIException">Thrown when <paramref name="request"/> or <paramref name="accountId"/> is invalid.</exception>
+        public async Task AddRelatedEntities(RegisterRequestData request, string accountId)
+        {
+            if (request == null)
+                throw APIException.BadRequest("Registration request cannot be null.", nameof(request));
+
+            if (string.IsNullOrWhiteSpace(accountId))
+                throw APIException.BadRequest("Account ID is required.", nameof(accountId));
+
+            var roles = request.Roles?.Distinct(StringComparer.OrdinalIgnoreCase).ToList() ?? new List<string>();
+            if (!roles.Any())
+            {
+                _logger.LogInformation("No roles provided for account {AccountId}; skipping entity creation.", accountId);
+                return;
+            }
+
+            var entitiesCreated = new List<string>();
+
+            // === Rule 1: If role includes Player → create Address and Player entities ===
+            if (roles.Contains("Player", StringComparer.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    // Create Address entity
+                    if (request.Address == null)
+                        throw APIException.BadRequest("Address information is required for player registration.");
+
+                    var address = new Address
+                    {
+                        CountryIso2 = request.Address.CountryIso2,
+                        StateIso2 = request.Address.StateIso2,
+                        City = request.Address.City,
+                        StreetTypeId = request.Address.StreetTypeId,
+                        StreetName = request.Address.StreetName,
+                        Building = request.Address.Building,
+                        Apartment = request.Address.Apartment
+                    };
+
+                    await _addressRepository.AddAsync(address);
+                    entitiesCreated.Add(nameof(Address));
+
+                    // Create Player entity linked to the account and address
+                    var player = new Player
+                    {
+                        Id = accountId,
+                        AddressId = address.Id
+                    };
+
+                    await _playerRepository.AddAsync(player);
+                    entitiesCreated.Add(nameof(Player));
+
+                    _logger.LogInformation("Player entity created for account {AccountId} (AddressId: {AddressId}).", accountId, address.Id);
+                }
+                catch (APIException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    throw APIException.Internal(
+                        "Failed to create Player-related entities during registration.",
+                        ex.Message,
+                        ex);
+                }
+            }
+
+            // === Rule 2: If Staff, Sponsor, or Admin (with valid IBAN) → create HasIBAN entity ===
+            bool requiresIban =
+                roles.Contains("Staff", StringComparer.OrdinalIgnoreCase) ||
+                roles.Contains("Sponsor", StringComparer.OrdinalIgnoreCase) ||
+                (roles.Contains("Admin", StringComparer.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(request.IBAN));
+
+            if (requiresIban)
+            {
+                if (string.IsNullOrWhiteSpace(request.IBAN))
+                {
+                    _logger.LogWarning(
+                        "Account {AccountId} has a role requiring IBAN, but IBAN was not provided.",
+                        accountId);
+                }
+                else
+                {
+                    var ibanEntity = new HasIBAN
+                    {
+                        Id = accountId,
+                        IBAN = request.IBAN
+                    };
+
+                    await _ibanRepository.AddAsync(ibanEntity);
+                    entitiesCreated.Add(nameof(HasIBAN));
+                }
+            }
+
+            // === Logging Summary ===
+            if (entitiesCreated.Any())
+                _logger.LogInformation(
+                    "Created related entities [{Entities}] for account {AccountId}.",
+                    string.Join(", ", entitiesCreated), accountId);
+            else
+                _logger.LogInformation("No related entities created for account {AccountId}.", accountId);
+        }
+    }
+}
+
+
+===== Migrations/20251107174200_InitialMigration.cs =====
+﻿using System;
+using Microsoft.EntityFrameworkCore.Migrations;
+using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
+
+#nullable disable
+
+namespace YuGiOh.Infrastructure.Migrations
+{
+    /// <inheritdoc />
+    public partial class InitialMigration : Migration
+    {
+        /// <inheritdoc />
+        protected override void Up(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.CreateTable(
+                name: "AspNetRoles",
+                columns: table => new
+                {
+                    Id = table.Column<string>(type: "text", nullable: false),
+                    Name = table.Column<string>(type: "character varying(256)", maxLength: 256, nullable: true),
+                    NormalizedName = table.Column<string>(type: "character varying(256)", maxLength: 256, nullable: true),
+                    ConcurrencyStamp = table.Column<string>(type: "text", nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AspNetRoles", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AspNetUsers",
+                columns: table => new
+                {
+                    Id = table.Column<string>(type: "text", nullable: false),
+                    CreatedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: false, defaultValueSql: "(timezone('utc', now()))"),
+                    UserName = table.Column<string>(type: "character varying(256)", maxLength: 256, nullable: true),
+                    NormalizedUserName = table.Column<string>(type: "character varying(256)", maxLength: 256, nullable: true),
+                    Email = table.Column<string>(type: "character varying(256)", maxLength: 256, nullable: true),
+                    NormalizedEmail = table.Column<string>(type: "character varying(256)", maxLength: 256, nullable: true),
+                    EmailConfirmed = table.Column<bool>(type: "boolean", nullable: false),
+                    PasswordHash = table.Column<string>(type: "text", nullable: true),
+                    SecurityStamp = table.Column<string>(type: "text", nullable: true),
+                    ConcurrencyStamp = table.Column<string>(type: "text", nullable: true),
+                    PhoneNumber = table.Column<string>(type: "text", nullable: true),
+                    PhoneNumberConfirmed = table.Column<bool>(type: "boolean", nullable: false),
+                    TwoFactorEnabled = table.Column<bool>(type: "boolean", nullable: false),
+                    LockoutEnd = table.Column<DateTimeOffset>(type: "timestamp with time zone", nullable: true),
+                    LockoutEnabled = table.Column<bool>(type: "boolean", nullable: false),
+                    AccessFailedCount = table.Column<int>(type: "integer", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AspNetUsers", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "RefreshTokens",
+                columns: table => new
+                {
+                    Token = table.Column<string>(type: "character varying(200)", maxLength: 200, nullable: false),
+                    AccountId = table.Column<string>(type: "character varying(50)", maxLength: 50, nullable: false),
+                    Expires = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    Created = table.Column<DateTime>(type: "timestamp with time zone", nullable: false, defaultValueSql: "(timezone('utc', now()))"),
+                    CreatedByIp = table.Column<string>(type: "character varying(45)", maxLength: 45, nullable: false),
+                    Revoked = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    RevokedByIp = table.Column<string>(type: "character varying(45)", maxLength: 45, nullable: true),
+                    ReplacedByToken = table.Column<string>(type: "character varying(200)", maxLength: 200, nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_RefreshTokens", x => x.Token);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "StreetTypes",
+                columns: table => new
+                {
+                    Id = table.Column<int>(type: "integer", nullable: false)
+                        .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
+                    Language = table.Column<string>(type: "text", nullable: false),
+                    Name = table.Column<string>(type: "character varying(50)", maxLength: 50, nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_StreetTypes", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AspNetRoleClaims",
+                columns: table => new
+                {
+                    Id = table.Column<int>(type: "integer", nullable: false)
+                        .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
+                    RoleId = table.Column<string>(type: "text", nullable: false),
+                    ClaimType = table.Column<string>(type: "text", nullable: true),
+                    ClaimValue = table.Column<string>(type: "text", nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AspNetRoleClaims", x => x.Id);
+                    table.ForeignKey(
+                        name: "FK_AspNetRoleClaims_AspNetRoles_RoleId",
+                        column: x => x.RoleId,
+                        principalTable: "AspNetRoles",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AspNetUserClaims",
+                columns: table => new
+                {
+                    Id = table.Column<int>(type: "integer", nullable: false)
+                        .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
+                    UserId = table.Column<string>(type: "text", nullable: false),
+                    ClaimType = table.Column<string>(type: "text", nullable: true),
+                    ClaimValue = table.Column<string>(type: "text", nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AspNetUserClaims", x => x.Id);
+                    table.ForeignKey(
+                        name: "FK_AspNetUserClaims_AspNetUsers_UserId",
+                        column: x => x.UserId,
+                        principalTable: "AspNetUsers",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AspNetUserLogins",
+                columns: table => new
+                {
+                    LoginProvider = table.Column<string>(type: "text", nullable: false),
+                    ProviderKey = table.Column<string>(type: "text", nullable: false),
+                    ProviderDisplayName = table.Column<string>(type: "text", nullable: true),
+                    UserId = table.Column<string>(type: "text", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AspNetUserLogins", x => new { x.LoginProvider, x.ProviderKey });
+                    table.ForeignKey(
+                        name: "FK_AspNetUserLogins_AspNetUsers_UserId",
+                        column: x => x.UserId,
+                        principalTable: "AspNetUsers",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AspNetUserRoles",
+                columns: table => new
+                {
+                    UserId = table.Column<string>(type: "text", nullable: false),
+                    RoleId = table.Column<string>(type: "text", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AspNetUserRoles", x => new { x.UserId, x.RoleId });
+                    table.ForeignKey(
+                        name: "FK_AspNetUserRoles_AspNetRoles_RoleId",
+                        column: x => x.RoleId,
+                        principalTable: "AspNetRoles",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                    table.ForeignKey(
+                        name: "FK_AspNetUserRoles_AspNetUsers_UserId",
+                        column: x => x.UserId,
+                        principalTable: "AspNetUsers",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AspNetUserTokens",
+                columns: table => new
+                {
+                    UserId = table.Column<string>(type: "text", nullable: false),
+                    LoginProvider = table.Column<string>(type: "text", nullable: false),
+                    Name = table.Column<string>(type: "text", nullable: false),
+                    Value = table.Column<string>(type: "text", nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AspNetUserTokens", x => new { x.UserId, x.LoginProvider, x.Name });
+                    table.ForeignKey(
+                        name: "FK_AspNetUserTokens_AspNetUsers_UserId",
+                        column: x => x.UserId,
+                        principalTable: "AspNetUsers",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "HasIBAN",
+                columns: table => new
+                {
+                    Id = table.Column<string>(type: "text", nullable: false),
+                    IBAN = table.Column<string>(type: "character varying(50)", maxLength: 50, nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_HasIBAN", x => x.Id);
+                    table.ForeignKey(
+                        name: "FK_HasIBAN_AspNetUsers_Id",
+                        column: x => x.Id,
+                        principalTable: "AspNetUsers",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "Addresses",
+                columns: table => new
+                {
+                    Id = table.Column<int>(type: "integer", nullable: false)
+                        .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
+                    CountryIso2 = table.Column<string>(type: "text", nullable: false),
+                    StateIso2 = table.Column<string>(type: "text", nullable: true),
+                    City = table.Column<string>(type: "text", nullable: true),
+                    StreetTypeId = table.Column<int>(type: "integer", nullable: true),
+                    StreetName = table.Column<string>(type: "character varying(200)", maxLength: 200, nullable: true),
+                    Building = table.Column<string>(type: "character varying(100)", maxLength: 100, nullable: true),
+                    Apartment = table.Column<string>(type: "character varying(50)", maxLength: 50, nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_Addresses", x => x.Id);
+                    table.ForeignKey(
+                        name: "FK_Addresses_StreetTypes_StreetTypeId",
+                        column: x => x.StreetTypeId,
+                        principalTable: "StreetTypes",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Restrict);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "Players",
+                columns: table => new
+                {
+                    Id = table.Column<string>(type: "character varying(50)", maxLength: 50, nullable: false),
+                    AddressId = table.Column<int>(type: "integer", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_Players", x => x.Id);
+                    table.ForeignKey(
+                        name: "FK_Players_Addresses_AddressId",
+                        column: x => x.AddressId,
+                        principalTable: "Addresses",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_Addresses_StreetTypeId",
+                table: "Addresses",
+                column: "StreetTypeId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AspNetRoleClaims_RoleId",
+                table: "AspNetRoleClaims",
+                column: "RoleId");
+
+            migrationBuilder.CreateIndex(
+                name: "RoleNameIndex",
+                table: "AspNetRoles",
+                column: "NormalizedName",
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AspNetUserClaims_UserId",
+                table: "AspNetUserClaims",
+                column: "UserId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AspNetUserLogins_UserId",
+                table: "AspNetUserLogins",
+                column: "UserId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AspNetUserRoles_RoleId",
+                table: "AspNetUserRoles",
+                column: "RoleId");
+
+            migrationBuilder.CreateIndex(
+                name: "EmailIndex",
+                table: "AspNetUsers",
+                column: "NormalizedEmail");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AspNetUsers_Email",
+                table: "AspNetUsers",
+                column: "Email",
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "IX_AspNetUsers_UserName",
+                table: "AspNetUsers",
+                column: "UserName",
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "UserNameIndex",
+                table: "AspNetUsers",
+                column: "NormalizedUserName",
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "IX_HasIBAN_IBAN",
+                table: "HasIBAN",
+                column: "IBAN",
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "IX_Players_AddressId",
+                table: "Players",
+                column: "AddressId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_RefreshTokens_AccountId",
+                table: "RefreshTokens",
+                column: "AccountId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_RefreshTokens_AccountId_Revoked",
+                table: "RefreshTokens",
+                columns: new[] { "AccountId", "Revoked" },
+                unique: true,
+                filter: "\"Revoked\" IS NULL");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_StreetTypes_Name",
+                table: "StreetTypes",
+                column: "Name",
+                unique: true);
+        }
+
+        /// <inheritdoc />
+        protected override void Down(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.DropTable(
+                name: "AspNetRoleClaims");
+
+            migrationBuilder.DropTable(
+                name: "AspNetUserClaims");
+
+            migrationBuilder.DropTable(
+                name: "AspNetUserLogins");
+
+            migrationBuilder.DropTable(
+                name: "AspNetUserRoles");
+
+            migrationBuilder.DropTable(
+                name: "AspNetUserTokens");
+
+            migrationBuilder.DropTable(
+                name: "HasIBAN");
+
+            migrationBuilder.DropTable(
+                name: "Players");
+
+            migrationBuilder.DropTable(
+                name: "RefreshTokens");
+
+            migrationBuilder.DropTable(
+                name: "AspNetRoles");
+
+            migrationBuilder.DropTable(
+                name: "AspNetUsers");
+
+            migrationBuilder.DropTable(
+                name: "Addresses");
+
+            migrationBuilder.DropTable(
+                name: "StreetTypes");
+        }
+    }
+}
+
+
+===== Migrations/20251107174200_InitialMigration.Designer.cs =====
+﻿// <auto-generated />
+using System;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
+using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
+using YuGiOh.Infrastructure.Persistence;
+
+#nullable disable
+
+namespace YuGiOh.Infrastructure.Migrations
+{
+    [DbContext(typeof(YuGiOhDbContext))]
+    [Migration("20251107174200_InitialMigration")]
+    partial class InitialMigration
+    {
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
+        {
+#pragma warning disable 612, 618
+            modelBuilder
+                .HasAnnotation("Comment", "Yu-Gi-Oh! Application Persistence Layer Context")
+                .HasAnnotation("ProductVersion", "7.0.20")
+                .HasAnnotation("Relational:MaxIdentifierLength", 63);
+
+            NpgsqlModelBuilderExtensions.UseIdentityByDefaultColumns(modelBuilder);
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityRole", b =>
+                {
+                    b.Property<string>("Id")
+                        .HasColumnType("text");
+
+                    b.Property<string>("ConcurrencyStamp")
+                        .IsConcurrencyToken()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Name")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<string>("NormalizedName")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("NormalizedName")
+                        .IsUnique()
+                        .HasDatabaseName("RoleNameIndex");
+
+                    b.ToTable("AspNetRoles", (string)null);
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityRoleClaim<string>", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("ClaimType")
+                        .HasColumnType("text");
+
+                    b.Property<string>("ClaimValue")
+                        .HasColumnType("text");
+
+                    b.Property<string>("RoleId")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("RoleId");
+
+                    b.ToTable("AspNetRoleClaims", (string)null);
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityUserClaim<string>", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("ClaimType")
+                        .HasColumnType("text");
+
+                    b.Property<string>("ClaimValue")
+                        .HasColumnType("text");
+
+                    b.Property<string>("UserId")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("UserId");
+
+                    b.ToTable("AspNetUserClaims", (string)null);
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityUserLogin<string>", b =>
+                {
+                    b.Property<string>("LoginProvider")
+                        .HasColumnType("text");
+
+                    b.Property<string>("ProviderKey")
+                        .HasColumnType("text");
+
+                    b.Property<string>("ProviderDisplayName")
+                        .HasColumnType("text");
+
+                    b.Property<string>("UserId")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.HasKey("LoginProvider", "ProviderKey");
+
+                    b.HasIndex("UserId");
+
+                    b.ToTable("AspNetUserLogins", (string)null);
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityUserRole<string>", b =>
+                {
+                    b.Property<string>("UserId")
+                        .HasColumnType("text");
+
+                    b.Property<string>("RoleId")
+                        .HasColumnType("text");
+
+                    b.HasKey("UserId", "RoleId");
+
+                    b.HasIndex("RoleId");
+
+                    b.ToTable("AspNetUserRoles", (string)null);
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityUserToken<string>", b =>
+                {
+                    b.Property<string>("UserId")
+                        .HasColumnType("text");
+
+                    b.Property<string>("LoginProvider")
+                        .HasColumnType("text");
+
+                    b.Property<string>("Name")
+                        .HasColumnType("text");
+
+                    b.Property<string>("Value")
+                        .HasColumnType("text");
+
+                    b.HasKey("UserId", "LoginProvider", "Name");
+
+                    b.ToTable("AspNetUserTokens", (string)null);
+                });
+
+            modelBuilder.Entity("YuGiOh.Domain.Models.Address", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Apartment")
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
+
+                    b.Property<string>("Building")
+                        .HasMaxLength(100)
+                        .HasColumnType("character varying(100)");
+
+                    b.Property<string>("City")
+                        .HasColumnType("text");
+
+                    b.Property<string>("CountryIso2")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("StateIso2")
+                        .HasColumnType("text");
+
+                    b.Property<string>("StreetName")
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)");
+
+                    b.Property<int?>("StreetTypeId")
+                        .HasColumnType("integer");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("StreetTypeId");
+
+                    b.ToTable("Addresses", (string)null);
+                });
+
+            modelBuilder.Entity("YuGiOh.Domain.Models.HasIBAN", b =>
+                {
+                    b.Property<string>("Id")
+                        .HasColumnType("text");
+
+                    b.Property<string>("IBAN")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("IBAN")
+                        .IsUnique();
+
+                    b.ToTable("HasIBAN", (string)null);
+                });
+
+            modelBuilder.Entity("YuGiOh.Domain.Models.Player", b =>
+                {
+                    b.Property<string>("Id")
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
+
+                    b.Property<int>("AddressId")
+                        .HasColumnType("integer");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("AddressId");
+
+                    b.ToTable("Players", (string)null);
+                });
+
+            modelBuilder.Entity("YuGiOh.Domain.Models.RefreshTokenData", b =>
+                {
+                    b.Property<string>("Token")
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)");
+
+                    b.Property<string>("AccountId")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
+
+                    b.Property<DateTime>("Created")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasDefaultValueSql("(timezone('utc', now()))");
+
+                    b.Property<string>("CreatedByIp")
+                        .IsRequired()
+                        .HasMaxLength(45)
+                        .HasColumnType("character varying(45)");
+
+                    b.Property<DateTime>("Expires")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("ReplacedByToken")
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)");
+
+                    b.Property<DateTime?>("Revoked")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("RevokedByIp")
+                        .HasMaxLength(45)
+                        .HasColumnType("character varying(45)");
+
+                    b.HasKey("Token");
+
+                    b.HasIndex("AccountId");
+
+                    b.HasIndex("AccountId", "Revoked")
+                        .IsUnique()
+                        .HasFilter("\"Revoked\" IS NULL");
+
+                    b.ToTable("RefreshTokens", (string)null);
+                });
+
+            modelBuilder.Entity("YuGiOh.Domain.Models.StreetType", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Language")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Name")
+                        .IsUnique();
+
+                    b.ToTable("StreetTypes", (string)null);
+                });
+
+            modelBuilder.Entity("YuGiOh.Infrastructure.Identity.Account", b =>
+                {
+                    b.Property<string>("Id")
+                        .HasColumnType("text");
+
+                    b.Property<int>("AccessFailedCount")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("ConcurrencyStamp")
+                        .IsConcurrencyToken()
+                        .HasColumnType("text");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasDefaultValueSql("(timezone('utc', now()))");
+
+                    b.Property<string>("Email")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<bool>("EmailConfirmed")
+                        .HasColumnType("boolean");
+
+                    b.Property<bool>("LockoutEnabled")
+                        .HasColumnType("boolean");
+
+                    b.Property<DateTimeOffset?>("LockoutEnd")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("NormalizedEmail")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<string>("NormalizedUserName")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<string>("PasswordHash")
+                        .HasColumnType("text");
+
+                    b.Property<string>("PhoneNumber")
+                        .HasColumnType("text");
+
+                    b.Property<bool>("PhoneNumberConfirmed")
+                        .HasColumnType("boolean");
+
+                    b.Property<string>("SecurityStamp")
+                        .HasColumnType("text");
+
+                    b.Property<bool>("TwoFactorEnabled")
+                        .HasColumnType("boolean");
+
+                    b.Property<string>("UserName")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Email")
+                        .IsUnique();
+
+                    b.HasIndex("NormalizedEmail")
+                        .HasDatabaseName("EmailIndex");
+
+                    b.HasIndex("NormalizedUserName")
+                        .IsUnique()
+                        .HasDatabaseName("UserNameIndex");
+
+                    b.HasIndex("UserName")
+                        .IsUnique();
+
+                    b.ToTable("AspNetUsers", (string)null);
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityRoleClaim<string>", b =>
+                {
+                    b.HasOne("Microsoft.AspNetCore.Identity.IdentityRole", null)
+                        .WithMany()
+                        .HasForeignKey("RoleId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityUserClaim<string>", b =>
+                {
+                    b.HasOne("YuGiOh.Infrastructure.Identity.Account", null)
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityUserLogin<string>", b =>
+                {
+                    b.HasOne("YuGiOh.Infrastructure.Identity.Account", null)
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityUserRole<string>", b =>
+                {
+                    b.HasOne("Microsoft.AspNetCore.Identity.IdentityRole", null)
+                        .WithMany()
+                        .HasForeignKey("RoleId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("YuGiOh.Infrastructure.Identity.Account", null)
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityUserToken<string>", b =>
+                {
+                    b.HasOne("YuGiOh.Infrastructure.Identity.Account", null)
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("YuGiOh.Domain.Models.Address", b =>
+                {
+                    b.HasOne("YuGiOh.Domain.Models.StreetType", "StreetType")
+                        .WithMany()
+                        .HasForeignKey("StreetTypeId")
+                        .OnDelete(DeleteBehavior.Restrict);
+
+                    b.Navigation("StreetType");
+                });
+
+            modelBuilder.Entity("YuGiOh.Domain.Models.HasIBAN", b =>
+                {
+                    b.HasOne("YuGiOh.Infrastructure.Identity.Account", null)
+                        .WithOne()
+                        .HasForeignKey("YuGiOh.Domain.Models.HasIBAN", "Id")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("YuGiOh.Domain.Models.Player", b =>
+                {
+                    b.HasOne("YuGiOh.Domain.Models.Address", "Address")
+                        .WithMany("Players")
+                        .HasForeignKey("AddressId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Address");
+                });
+
+            modelBuilder.Entity("YuGiOh.Domain.Models.Address", b =>
+                {
+                    b.Navigation("Players");
+                });
+#pragma warning restore 612, 618
+        }
+    }
+}
+
+
+===== Migrations/YuGiOhDbContextModelSnapshot.cs =====
+﻿// <auto-generated />
+using System;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
+using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
+using YuGiOh.Infrastructure.Persistence;
+
+#nullable disable
+
+namespace YuGiOh.Infrastructure.Migrations
+{
+    [DbContext(typeof(YuGiOhDbContext))]
+    partial class YuGiOhDbContextModelSnapshot : ModelSnapshot
+    {
+        protected override void BuildModel(ModelBuilder modelBuilder)
+        {
+#pragma warning disable 612, 618
+            modelBuilder
+                .HasAnnotation("Comment", "Yu-Gi-Oh! Application Persistence Layer Context")
+                .HasAnnotation("ProductVersion", "7.0.20")
+                .HasAnnotation("Relational:MaxIdentifierLength", 63);
+
+            NpgsqlModelBuilderExtensions.UseIdentityByDefaultColumns(modelBuilder);
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityRole", b =>
+                {
+                    b.Property<string>("Id")
+                        .HasColumnType("text");
+
+                    b.Property<string>("ConcurrencyStamp")
+                        .IsConcurrencyToken()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Name")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<string>("NormalizedName")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("NormalizedName")
+                        .IsUnique()
+                        .HasDatabaseName("RoleNameIndex");
+
+                    b.ToTable("AspNetRoles", (string)null);
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityRoleClaim<string>", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("ClaimType")
+                        .HasColumnType("text");
+
+                    b.Property<string>("ClaimValue")
+                        .HasColumnType("text");
+
+                    b.Property<string>("RoleId")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("RoleId");
+
+                    b.ToTable("AspNetRoleClaims", (string)null);
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityUserClaim<string>", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("ClaimType")
+                        .HasColumnType("text");
+
+                    b.Property<string>("ClaimValue")
+                        .HasColumnType("text");
+
+                    b.Property<string>("UserId")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("UserId");
+
+                    b.ToTable("AspNetUserClaims", (string)null);
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityUserLogin<string>", b =>
+                {
+                    b.Property<string>("LoginProvider")
+                        .HasColumnType("text");
+
+                    b.Property<string>("ProviderKey")
+                        .HasColumnType("text");
+
+                    b.Property<string>("ProviderDisplayName")
+                        .HasColumnType("text");
+
+                    b.Property<string>("UserId")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.HasKey("LoginProvider", "ProviderKey");
+
+                    b.HasIndex("UserId");
+
+                    b.ToTable("AspNetUserLogins", (string)null);
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityUserRole<string>", b =>
+                {
+                    b.Property<string>("UserId")
+                        .HasColumnType("text");
+
+                    b.Property<string>("RoleId")
+                        .HasColumnType("text");
+
+                    b.HasKey("UserId", "RoleId");
+
+                    b.HasIndex("RoleId");
+
+                    b.ToTable("AspNetUserRoles", (string)null);
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityUserToken<string>", b =>
+                {
+                    b.Property<string>("UserId")
+                        .HasColumnType("text");
+
+                    b.Property<string>("LoginProvider")
+                        .HasColumnType("text");
+
+                    b.Property<string>("Name")
+                        .HasColumnType("text");
+
+                    b.Property<string>("Value")
+                        .HasColumnType("text");
+
+                    b.HasKey("UserId", "LoginProvider", "Name");
+
+                    b.ToTable("AspNetUserTokens", (string)null);
+                });
+
+            modelBuilder.Entity("YuGiOh.Domain.Models.Address", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Apartment")
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
+
+                    b.Property<string>("Building")
+                        .HasMaxLength(100)
+                        .HasColumnType("character varying(100)");
+
+                    b.Property<string>("City")
+                        .HasColumnType("text");
+
+                    b.Property<string>("CountryIso2")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("StateIso2")
+                        .HasColumnType("text");
+
+                    b.Property<string>("StreetName")
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)");
+
+                    b.Property<int?>("StreetTypeId")
+                        .HasColumnType("integer");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("StreetTypeId");
+
+                    b.ToTable("Addresses", (string)null);
+                });
+
+            modelBuilder.Entity("YuGiOh.Domain.Models.HasIBAN", b =>
+                {
+                    b.Property<string>("Id")
+                        .HasColumnType("text");
+
+                    b.Property<string>("IBAN")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("IBAN")
+                        .IsUnique();
+
+                    b.ToTable("HasIBAN", (string)null);
+                });
+
+            modelBuilder.Entity("YuGiOh.Domain.Models.Player", b =>
+                {
+                    b.Property<string>("Id")
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
+
+                    b.Property<int>("AddressId")
+                        .HasColumnType("integer");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("AddressId");
+
+                    b.ToTable("Players", (string)null);
+                });
+
+            modelBuilder.Entity("YuGiOh.Domain.Models.RefreshTokenData", b =>
+                {
+                    b.Property<string>("Token")
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)");
+
+                    b.Property<string>("AccountId")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
+
+                    b.Property<DateTime>("Created")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasDefaultValueSql("(timezone('utc', now()))");
+
+                    b.Property<string>("CreatedByIp")
+                        .IsRequired()
+                        .HasMaxLength(45)
+                        .HasColumnType("character varying(45)");
+
+                    b.Property<DateTime>("Expires")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("ReplacedByToken")
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)");
+
+                    b.Property<DateTime?>("Revoked")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("RevokedByIp")
+                        .HasMaxLength(45)
+                        .HasColumnType("character varying(45)");
+
+                    b.HasKey("Token");
+
+                    b.HasIndex("AccountId");
+
+                    b.HasIndex("AccountId", "Revoked")
+                        .IsUnique()
+                        .HasFilter("\"Revoked\" IS NULL");
+
+                    b.ToTable("RefreshTokens", (string)null);
+                });
+
+            modelBuilder.Entity("YuGiOh.Domain.Models.StreetType", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Language")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Name")
+                        .IsUnique();
+
+                    b.ToTable("StreetTypes", (string)null);
+                });
+
+            modelBuilder.Entity("YuGiOh.Infrastructure.Identity.Account", b =>
+                {
+                    b.Property<string>("Id")
+                        .HasColumnType("text");
+
+                    b.Property<int>("AccessFailedCount")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("ConcurrencyStamp")
+                        .IsConcurrencyToken()
+                        .HasColumnType("text");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("timestamp with time zone")
+                        .HasDefaultValueSql("(timezone('utc', now()))");
+
+                    b.Property<string>("Email")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<bool>("EmailConfirmed")
+                        .HasColumnType("boolean");
+
+                    b.Property<bool>("LockoutEnabled")
+                        .HasColumnType("boolean");
+
+                    b.Property<DateTimeOffset?>("LockoutEnd")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("NormalizedEmail")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<string>("NormalizedUserName")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<string>("PasswordHash")
+                        .HasColumnType("text");
+
+                    b.Property<string>("PhoneNumber")
+                        .HasColumnType("text");
+
+                    b.Property<bool>("PhoneNumberConfirmed")
+                        .HasColumnType("boolean");
+
+                    b.Property<string>("SecurityStamp")
+                        .HasColumnType("text");
+
+                    b.Property<bool>("TwoFactorEnabled")
+                        .HasColumnType("boolean");
+
+                    b.Property<string>("UserName")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Email")
+                        .IsUnique();
+
+                    b.HasIndex("NormalizedEmail")
+                        .HasDatabaseName("EmailIndex");
+
+                    b.HasIndex("NormalizedUserName")
+                        .IsUnique()
+                        .HasDatabaseName("UserNameIndex");
+
+                    b.HasIndex("UserName")
+                        .IsUnique();
+
+                    b.ToTable("AspNetUsers", (string)null);
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityRoleClaim<string>", b =>
+                {
+                    b.HasOne("Microsoft.AspNetCore.Identity.IdentityRole", null)
+                        .WithMany()
+                        .HasForeignKey("RoleId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityUserClaim<string>", b =>
+                {
+                    b.HasOne("YuGiOh.Infrastructure.Identity.Account", null)
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityUserLogin<string>", b =>
+                {
+                    b.HasOne("YuGiOh.Infrastructure.Identity.Account", null)
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityUserRole<string>", b =>
+                {
+                    b.HasOne("Microsoft.AspNetCore.Identity.IdentityRole", null)
+                        .WithMany()
+                        .HasForeignKey("RoleId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("YuGiOh.Infrastructure.Identity.Account", null)
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityUserToken<string>", b =>
+                {
+                    b.HasOne("YuGiOh.Infrastructure.Identity.Account", null)
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("YuGiOh.Domain.Models.Address", b =>
+                {
+                    b.HasOne("YuGiOh.Domain.Models.StreetType", "StreetType")
+                        .WithMany()
+                        .HasForeignKey("StreetTypeId")
+                        .OnDelete(DeleteBehavior.Restrict);
+
+                    b.Navigation("StreetType");
+                });
+
+            modelBuilder.Entity("YuGiOh.Domain.Models.HasIBAN", b =>
+                {
+                    b.HasOne("YuGiOh.Infrastructure.Identity.Account", null)
+                        .WithOne()
+                        .HasForeignKey("YuGiOh.Domain.Models.HasIBAN", "Id")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("YuGiOh.Domain.Models.Player", b =>
+                {
+                    b.HasOne("YuGiOh.Domain.Models.Address", "Address")
+                        .WithMany("Players")
+                        .HasForeignKey("AddressId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Address");
+                });
+
+            modelBuilder.Entity("YuGiOh.Domain.Models.Address", b =>
+                {
+                    b.Navigation("Players");
+                });
+#pragma warning restore 612, 618
+        }
+    }
+}
+
+
+===== obj/Debug/net7.0/.NETCoreApp,Version=v7.0.AssemblyAttributes.cs =====
+// <autogenerated />
+using System;
+using System.Reflection;
+[assembly: global::System.Runtime.Versioning.TargetFrameworkAttribute(".NETCoreApp,Version=v7.0", FrameworkDisplayName = ".NET 7.0")]
+
+
+===== obj/Debug/net7.0/YuGiOh.Infrastructure.AssemblyInfo.cs =====
+//------------------------------------------------------------------------------
+// <auto-generated>
+//     This code was generated by a tool.
+//
+//     Changes to this file may cause incorrect behavior and will be lost if
+//     the code is regenerated.
+// </auto-generated>
+//------------------------------------------------------------------------------
+
+using System;
+using System.Reflection;
+
+[assembly: Microsoft.AspNetCore.Identity.UI.UIFrameworkAttribute("Bootstrap5")]
+[assembly: System.Reflection.AssemblyCompanyAttribute("YuGiOh.Infrastructure")]
+[assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
+[assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyProductAttribute("YuGiOh.Infrastructure")]
+[assembly: System.Reflection.AssemblyTitleAttribute("YuGiOh.Infrastructure")]
+[assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
+
+// Generated by the MSBuild WriteCodeFragment class.
+
+
+
+===== obj/Debug/net7.0/YuGiOh.Infrastructure.GlobalUsings.g.cs =====
+// <auto-generated/>
+global using global::System;
+global using global::System.Collections.Generic;
+global using global::System.IO;
+global using global::System.Linq;
+global using global::System.Net.Http;
+global using global::System.Threading;
+global using global::System.Threading.Tasks;
+
+
+===== Persistence/Configurations/AccountConfiguration.cs =====
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using YuGiOh.Infrastructure.Identity;
+
+namespace YuGiOh.Infrastructure.Persistence.Configurations
+{
+    /// <summary>
+    /// Configures the Entity Framework Core mapping for the <see cref="Account"/> entity.
+    /// This configuration defines how Identity accounts are persisted in the database,
+    /// ensuring proper defaults, constraints, and index structures.
+    /// </summary>
+    public class AccountConfiguration : IEntityTypeConfiguration<Account>
+    {
+        /// <summary>
+        /// Configures the <see cref="Account"/> entity properties and constraints.
+        /// </summary>
+        /// <param name="builder">The EntityTypeBuilder used to configure the entity.</param>
+        public void Configure(EntityTypeBuilder<Account> builder)
+        {
+            builder.Property(a => a.CreatedAt)
+                   .HasDefaultValueSql("(timezone('utc', now()))")
+                   .IsRequired();
+
+            // Ensure that the email and username are unique in the database for Identity accounts
+            builder.HasIndex(a => a.Email)
+                   .IsUnique();
+
+            builder.HasIndex(a => a.UserName)
+                   .IsUnique();
+
+
+        }
+    }
+}
+
+
+===== Persistence/Configurations/AddressConfiguration.cs =====
+using YuGiOh.Domain.DTOs;
+using YuGiOh.Domain.Models;
+
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace YuGiOh.Infrastructure.Persistence.Configurations
+{
+    public class AddressConfiguration : IEntityTypeConfiguration<Address>
+    {
+        public void Configure(EntityTypeBuilder<Address> builder)
+        {
+            builder.ToTable("Addresses");
+
+            builder.HasKey(a => a.Id);
+
+            builder.Property(a => a.StreetName)
+                   .HasMaxLength(200);
+
+            builder.Property(a => a.Building)
+                   .HasMaxLength(100)
+                   .IsRequired(false);
+
+            builder.Property(a => a.Apartment)
+                   .HasMaxLength(50)
+                   .IsRequired(false);
+
+            builder.Property(a => a.CountryIso2)
+                   .IsRequired();
+
+            builder.Property(a => a.StateIso2)
+                   .IsRequired(false);
+
+            builder.Property(a => a.City)
+                   .IsRequired(false);
+
+            builder.HasOne(a => a.StreetType)
+                   .WithMany()
+                   .HasForeignKey(a => a.StreetTypeId)
+                   .OnDelete(DeleteBehavior.Restrict);
+        }
+    }
+}
+
+
+===== Persistence/Configurations/ArchetypeConfiguration.cs =====
+// using Microsoft.EntityFrameworkCore;
+// using Microsoft.EntityFrameworkCore.Metadata.Builders;
+// using YuGiOh.Domain.Models;
+
+// namespace YuGiOh.Infrastructure.Persistence.Configurations
+// {
+//     public class ArchetypeConfiguration : IEntityTypeConfiguration<Archetype>
+//     {
+//         public void Configure(EntityTypeBuilder<Archetype> builder)
+//         {
+//             builder.ToTable("Archetypes");
+
+//             builder.HasKey(a => a.Id);
+
+//             builder.Property(a => a.Name)
+//                 .IsRequired()
+//                 .HasMaxLength(100);
+
+//             // Relationships
+//             builder.HasMany(a => a.Decks)
+//                 .WithOne(d => d.Archetype)
+//                 .HasForeignKey(d => d.ArchetypeId)
+//                 .OnDelete(DeleteBehavior.Restrict);
+//         }
+//     }
+// }
+
+
+===== Persistence/Configurations/DeckConfiguration.cs =====
+// using Microsoft.EntityFrameworkCore;
+// using Microsoft.EntityFrameworkCore.Metadata.Builders;
+// using YuGiOh.Domain.Models;
+
+// namespace YuGiOh.Infrastructure.Persistence.Configurations
+// {
+//     public class DeckConfiguration : IEntityTypeConfiguration<Deck>
+//     {
+//         public void Configure(EntityTypeBuilder<Deck> builder)
+//         {
+//             builder.ToTable("Decks");
+
+//             builder.HasKey(d => d.Id);
+
+//             builder.Property(d => d.Name)
+//                 .IsRequired()
+//                 .HasMaxLength(100);
+
+//             builder.Property(d => d.MainDeckSize)
+//                 .IsRequired();
+
+//             builder.Property(d => d.SideDeckSize)
+//                 .IsRequired();
+
+//             builder.Property(d => d.ExtraDeckSize)
+//                 .IsRequired();
+
+//             builder.Property(d => d.CreatedAt)
+//                 .IsRequired()
+//                 .HasDefaultValueSql("CURRENT_TIMESTAMP");
+
+//             // ✅ Range constraints
+//             builder.HasCheckConstraint("CK_Deck_MainDeckSize_Range", "[MainDeckSize] BETWEEN 40 AND 60");
+//             builder.HasCheckConstraint("CK_Deck_SideDeckSize_Range", "[SideDeckSize] BETWEEN 0 AND 15");
+//             builder.HasCheckConstraint("CK_Deck_ExtraDeckSize_Range", "[ExtraDeckSize] BETWEEN 0 AND 15");
+
+//             // Relationships
+//             builder.HasOne(d => d.Archetype)
+//                 .WithMany(a => a.Decks)
+//                 .HasForeignKey(d => d.ArchetypeId)
+//                 .OnDelete(DeleteBehavior.Restrict);
+
+//             builder.HasOne(d => d.Owner)
+//                 .WithMany(p => p.Decks)
+//                 .HasForeignKey(d => d.OwnerId)
+//                 .OnDelete(DeleteBehavior.Cascade);
+//         }
+//     }
+// }
+
+
+===== Persistence/Configurations/HasIBANConfiguration.cs =====
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using YuGiOh.Domain.Models;
+using YuGiOh.Infrastructure.Identity;
+
+namespace YuGiOh.Infrastructure.Persistence.Configurations
+{
+    /// <summary>
+    /// Configures the persistence mapping for the <see cref="HasIBAN"/> entity.
+    /// This table represents any account or user entity that possesses an IBAN,
+    /// such as staff, sponsors, or administrative financial accounts.
+    /// </summary>
+    public class HasIBANConfiguration : IEntityTypeConfiguration<HasIBAN>
+    {
+        /// <summary>
+        /// Applies the configuration for the <see cref="HasIBAN"/> entity.
+        /// </summary>
+        /// <param name="builder">The entity type builder used for configuration.</param>
+        public void Configure(EntityTypeBuilder<HasIBAN> builder)
+        {
+            // Map to "HasIBAN" table (singular form consistent with your other configs)
+            builder.ToTable("HasIBAN");
+
+            // Define primary key (string-based, same as Account.Id)
+            builder.HasKey(s => s.Id);
+
+            // Configure the IBAN property:
+            //  - Required (every record must have an IBAN)
+            //  - Max length of 50 characters (covers all valid IBAN formats)
+            builder.Property(s => s.IBAN)
+                   .IsRequired()
+                   .HasMaxLength(50);
+
+            // Enforce uniqueness: each IBAN can only belong to one entity.
+            builder.HasIndex(s => s.IBAN)
+                   .IsUnique();
+
+            // Define a relationship to Account if you want automatic cleanup
+            builder.HasOne<Account>()
+                   .WithOne()
+                   .HasForeignKey<HasIBAN>(s => s.Id)
+                   .OnDelete(DeleteBehavior.Cascade);
+        }
+    }
+}
+
+
+===== Persistence/Configurations/PlayerConfiguration.cs =====
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using YuGiOh.Domain.Models;
+
+namespace YuGiOh.Infrastructure.Persistence.Configurations
+{
+    /// <summary>
+    /// Configures the persistence mapping for the <see cref="Player"/> entity.
+    /// Each player represents a registered user who participates in tournaments or matches.
+    /// </summary>
+    public class PlayerConfiguration : IEntityTypeConfiguration<Player>
+    {
+        /// <summary>
+        /// Applies Entity Framework Core configuration for the <see cref="Player"/> entity.
+        /// </summary>
+        /// <param name="builder">The entity type builder used for configuration.</param>
+        public void Configure(EntityTypeBuilder<Player> builder)
+        {
+            // Map to "Players" table.
+            builder.ToTable("Players");
+
+            // Primary key: string-based ID (matches Account.Id in Identity)
+            builder.HasKey(p => p.Id);
+
+            builder.Property(p => p.Id)
+                   .IsRequired()
+                   .HasMaxLength(50);
+
+            // Relationship: Player → Address (many players can share the same address)
+            builder.HasOne(p => p.Address)
+                   .WithMany(a => a.Players)
+                   .HasForeignKey(p => p.AddressId)
+                   .OnDelete(DeleteBehavior.Cascade);
+        }
+    }
+}
+
+
+===== Persistence/Configurations/RefreshTokenDataConfiguraton.cs =====
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using YuGiOh.Domain.Models;
+
+namespace YuGiOh.Infrastructure.Persistence.Configurations
+{
+       /// <summary>
+       /// Configures the persistence mapping for the <see cref="RefreshTokenData"/> entity.
+       /// Defines how refresh tokens are stored, constrained, and indexed within the database.
+       /// </summary>
+       public class RefreshTokenDataConfiguration : IEntityTypeConfiguration<RefreshTokenData>
+       {
+              /// <summary>
+              /// Applies the configuration for the <see cref="RefreshTokenData"/> entity.
+              /// </summary>
+              /// <param name="builder">The entity builder used for configuration.</param>
+              public void Configure(EntityTypeBuilder<RefreshTokenData> builder)
+              {
+                     // Map to "RefreshTokens" table.
+                     builder.ToTable("RefreshTokens");
+
+                     // Set the primary key as the token string itself.
+                     builder.HasKey(r => r.Token);
+
+                     // Configure token column:
+                     // - Required
+                     // - Max length of 200 (supports JWT or UUID-like tokens)
+                     builder.Property(r => r.Token)
+                            .IsRequired()
+                            .HasMaxLength(200);
+
+                     // AccountId: reference to the Account entity (string-based Id from Identity)
+                     builder.Property(r => r.AccountId)
+                            .IsRequired()
+                            .HasMaxLength(50);
+
+                     // CreatedByIp: IP address where the token was generated
+                     builder.Property(r => r.CreatedByIp)
+                            .IsRequired()
+                            .HasMaxLength(45); // IPv6-safe
+
+                     // Optional RevokedByIp: the IP address that revoked the token
+                     builder.Property(r => r.RevokedByIp)
+                            .HasMaxLength(45);
+
+                     // Optional ReplacedByToken: link to new token when rotated
+                     builder.Property(r => r.ReplacedByToken)
+                            .HasMaxLength(200);
+
+                     // Dates (timestamps)
+                     builder.Property(r => r.Created)
+                            .IsRequired()
+                            .HasDefaultValueSql("(timezone('utc', now()))");
+
+                     builder.Property(r => r.Expires)
+                            .IsRequired();
+
+                     builder.Property(r => r.Revoked)
+                            .IsRequired(false);
+
+                     // Add an index on AccountId for faster lookups
+                     builder.HasIndex(r => r.AccountId);
+
+                     // Enforce that a user cannot have duplicate active tokens
+                     // via a unique filtered index (PostgreSQL only):
+                     builder.HasIndex(r => new { r.AccountId, r.Revoked })
+                            .HasFilter("\"Revoked\" IS NULL")
+                            .IsUnique();
+              }
+       }
+}
+
+
+===== Persistence/Configurations/SponsorConfiguration.cs =====
+// using Microsoft.EntityFrameworkCore;
+// using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+// using YuGiOh.Domain.Models;
+
+// namespace YuGiOh.Infrastructure.Persistence.Configurations
+// {
+//     public class SponsorConfiguration : IEntityTypeConfiguration<Sponsor>
+//     {
+//         public void Configure(EntityTypeBuilder<Sponsor> builder)
+//         {
+//             builder.ToTable("Sponsors");
+
+//             builder.HasKey(s => s.Id);
+
+//             builder.Property(s => s.Id)
+//                    .IsRequired()
+//                    .HasMaxLength(50);
+
+//             builder.Property(s => s.IBAN)
+//                    .HasMaxLength(34)
+//                    .IsRequired();
+
+//             // builder.HasMany(s => s.Sponsored)
+//             //        .WithOne(sp => sp.Sponsor)
+//             //        .HasForeignKey(sp => sp.SponsorId)
+//             //        .OnDelete(DeleteBehavior.Restrict);
+//         }
+//     }
+// }
+
+
+===== Persistence/Configurations/StreetTypeConfiguration.cs =====
+using YuGiOh.Domain.Models;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace YuGiOh.Infrastructure.Persistence.Configurations
+{
+    /// <summary>
+    /// Configures the Entity Framework Core persistence mapping for the <see cref="StreetType"/> entity.
+    /// This configuration ensures proper indexing, constraints, and table naming conventions
+    /// for the street type data stored in the database.
+    /// </summary>
+    public class StreetTypeConfiguration : IEntityTypeConfiguration<StreetType>
+    {
+        /// <summary>
+        /// Applies the configuration for the <see cref="StreetType"/> entity.
+        /// </summary>
+        /// <param name="builder">The entity type builder used to configure this entity.</param>
+        public void Configure(EntityTypeBuilder<StreetType> builder)
+        {
+            // Map entity to "StreetTypes" table.
+            // Table naming convention: pluralized, PascalCase.
+            builder.ToTable("StreetTypes");
+
+            // Define the primary key.
+            builder.HasKey(s => s.Id);
+
+            // Configure "Name" column:
+            //  - Required
+            //  - Maximum length of 50 characters
+            //  - Indexed uniquely (no duplicates)
+            builder.Property(s => s.Name)
+                   .IsRequired()
+                   .HasMaxLength(50);
+
+            builder.HasIndex(s => s.Name)
+                   .IsUnique();
+        }
+    }
+}
+
+
+===== Persistence/Repositories/DataRepository.cs =====
+using Ardalis.Specification;
+using Ardalis.Specification.EntityFrameworkCore;
+
+namespace YuGiOh.Infrastructure.Persistence.Repositories
+{
+    public class DataRepository<T> : RepositoryBase<T>, IRepositoryBase<T>, IReadRepositoryBase<T> where T : class
+    {
+        public DataRepository(YuGiOhDbContext dbContext) : base(dbContext) { }
+    }
+}
+
+===== Persistence/ServiceExtension.cs =====
+﻿using Ardalis.Specification;
+using Ardalis.Specification.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using YuGiOh.Infrastructure.Persistence.Repositories;
+
+namespace YuGiOh.Infrastructure.Persistence
+{
+    /// <summary>
+    /// Provides extension methods for registering the persistence layer services,
+    /// including the Entity Framework Core DbContext and repositories.
+    /// </summary>
+    public static class ServiceExtension
+    {
+        /// <summary>
+        /// Registers the <see cref="YuGiOhDbContext"/> with PostgreSQL provider
+        /// and the generic repositories for data access.
+        /// </summary>
+        /// <param name="services">The service collection to add to.</param>
+        /// <param name="configuration">The application configuration (used for connection string).</param>
+        /// <returns>The same <see cref="IServiceCollection"/> instance for chaining.</returns>
+        public static IServiceCollection AddPersistence(this IServiceCollection services, IConfiguration configuration)
+        {
+            // Configure DbContext with PostgreSQL provider
+            services.AddDbContext<YuGiOhDbContext>(options =>
+                options.UseNpgsql(
+                    configuration.GetConnectionString("DefaultConnection"),
+                    npgsqlOptions =>
+                    {
+                        npgsqlOptions.MigrationsAssembly(typeof(YuGiOhDbContext).Assembly.FullName);
+                        npgsqlOptions.EnableRetryOnFailure(
+                            maxRetryCount: 3,
+                            maxRetryDelay: TimeSpan.FromSeconds(5),
+                            errorCodesToAdd: null);
+                    })
+            // Optional: optimize for read-heavy workloads
+            // .UseQueryTrackingBehavior(QueryTrackingBehavior.NoTracking)
+            );
+
+            // Register generic repository implementations using Ardalis.Specification
+            services.AddScoped(typeof(IRepositoryBase<>), typeof(DataRepository<>));
+            services.AddScoped(typeof(IReadRepositoryBase<>), typeof(DataRepository<>));
+
+            return services;
+        }
+    }
+}
+
+
+===== Persistence/YuGiOhDbContext.cs =====
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore;
+using YuGiOh.Domain.Models;
+using YuGiOh.Infrastructure.Identity;
+
+namespace YuGiOh.Infrastructure.Persistence
+{
+    /// <summary>
+    /// Represents the Entity Framework Core database context for the Yu-Gi-Oh! application.
+    /// Integrates ASP.NET Identity with domain entities such as Players, Addresses, and StreetTypes.
+    /// </summary>
+    public class YuGiOhDbContext : IdentityDbContext<Account, IdentityRole, string>
+    {
+        /// <summary>
+        /// Initializes a new instance of the <see cref="YuGiOhDbContext"/> class.
+        /// </summary>
+        /// <param name="options">Database context configuration options.</param>
+        public YuGiOhDbContext(DbContextOptions<YuGiOhDbContext> options)
+            : base(options)
+        {
+        }
+
+        // === Domain Entities ===
+        public DbSet<Player> Players { get; set; } = default!;
+        public DbSet<StreetType> StreetTypes { get; set; } = default!;
+        public DbSet<Address> Addresses { get; set; } = default!;
+        public DbSet<HasIBAN> HasIBANs { get; set; } = default!;
+        public DbSet<RefreshTokenData> RefreshTokensData { get; set; } = default!;
+
+        /// <summary>
+        /// Configures the entity mappings and Identity schema for the context.
+        /// </summary>
+        /// <param name="builder">The model builder used to configure entity relationships and mappings.</param>
+        protected override void OnModelCreating(ModelBuilder builder)
+        {
+            // Apply ASP.NET Identity configuration
+            base.OnModelCreating(builder);
+
+            // Apply all configurations automatically from this assembly
+            builder.ApplyConfigurationsFromAssembly(typeof(YuGiOhDbContext).Assembly);
+
+            // Optional: Add schema comment for PostgreSQL
+            builder.HasAnnotation("Comment", "Yu-Gi-Oh! Application Persistence Layer Context");
+        }
+
+        /// <summary>
+        /// Ensures all DateTime fields are stored in UTC before saving to the database.
+        /// </summary>
+        public override async Task<int> SaveChangesAsync(CancellationToken cancellationToken = default)
+        {
+            foreach (var entry in ChangeTracker.Entries()
+                                               .Where(e => e.Entity is RefreshTokenData &&
+                                                           e.State is EntityState.Added or EntityState.Modified))
+            {
+                if (entry.Property("Created").CurrentValue is DateTime created)
+                    entry.Property("Created").CurrentValue = DateTime.SpecifyKind(created, DateTimeKind.Utc);
+                if (entry.Property("Expires").CurrentValue is DateTime expires)
+                    entry.Property("Expires").CurrentValue = DateTime.SpecifyKind(expires, DateTimeKind.Utc);
+            }
+
+            return await base.SaveChangesAsync(cancellationToken);
+        }
+    }
+}
+
+
+===== Seeding/DbSeeder.cs =====
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using YuGiOh.Infrastructure.Seeding.Tools;
+
+namespace YuGiOh.Infrastructure.Seeding
+{
+    public sealed class DbSeeder : IHostedService, IDisposable
+    {
+        #region Constructor
+        private readonly IServiceScopeFactory _scopeFactory;
+        private readonly ILogger<DbSeeder> _logger;
+        private Timer? _timer;
+
+        public DbSeeder(IServiceScopeFactory scopeFactory, ILogger<DbSeeder> logger)
+        {
+            _scopeFactory = scopeFactory ?? throw new ArgumentNullException(nameof(scopeFactory));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
+        #endregion
+
+        public Task StartAsync(CancellationToken cancellationToken)
+        {
+            _logger.LogInformation("🪴 DbSeeder initialized. First run starting...");
+            _timer = new Timer(async _ => await RunAsync(), null, TimeSpan.Zero, TimeSpan.FromDays(7));
+            return Task.CompletedTask;
+        }
+
+        private async Task RunAsync()
+        {
+
+            using var scope = _scopeFactory.CreateScope();
+            var seedingToolsProvider = scope.ServiceProvider.GetRequiredService<SeedingToolsProvider>();
+            try
+            {
+                _logger.LogInformation("🔄 Starting seeding cycle...");
+
+                for (int i = 0; i < seedingToolsProvider.SeedingTools.Count; i++)
+                {
+                    if (seedingToolsProvider.SeedingTools[i] is ISeeder tool)
+                        await tool.SeedAsync();
+                }
+
+                _logger.LogInformation("✅ Seeding cycle completed.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Error during seeding cycle.");
+            }
+        }
+
+        public Task StopAsync(CancellationToken cancellationToken)
+        {
+            _logger.LogInformation("🛑 DbSeeder stopping.");
+            _timer?.Change(Timeout.Infinite, 0);
+            return Task.CompletedTask;
+        }
+
+        public void Dispose()
+        {
+            _timer?.Dispose();
+        }
+    }
+}
+
+===== Seeding/Helpers/JsonReaderWrapper.cs =====
+using System.Text.Json;
+
+namespace YuGiOh.Infrastructure.Seeding.Helpers
+{
+    public static class JsonReaderWrapper
+    {
+        public static async Task<IEnumerable<T>> ResolveDataFromJson<T>(string? path = null)
+        {
+            var basePath = AppContext.BaseDirectory;
+            string? jsonPath;
+            if (path == null)
+            {
+                jsonPath = Path.Combine(basePath, $"{typeof(T).Name}.json");
+            }
+            else jsonPath = Path.Combine(basePath, $"{path}.json");
+
+            if (!File.Exists(jsonPath))
+            {
+                Console.WriteLine($"⚠️ JSON file not found: {jsonPath}");
+                return Array.Empty<T>();
+            }
+
+            var json = await File.ReadAllTextAsync(jsonPath);
+            var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            var entities = JsonSerializer.Deserialize<IEnumerable<T>>(json, options) ?? Array.Empty<T>();
+
+            return entities;
+            // use case: 
+            // var data = await JsonReaderWrapper.ResolveDataFromJson<T>();
+            // foreach (var element in data)
+            // {
+            //     Console.WriteLine(element);
+            // }
+        }
+    }
+}
+
+===== Seeding/ServiceExtension.cs =====
+using Microsoft.Extensions.DependencyInjection;
+using YuGiOh.Infrastructure.Seeding.Tools;
+
+namespace YuGiOh.Infrastructure.Seeding
+{
+    public static class ServiceExtension
+    {
+        public static IServiceCollection AddSeeding(this IServiceCollection services)
+        {
+            // Register the tools provider (creates seeding logic for each entity)
+            services.AddScoped<SeedingToolsProvider>();
+
+            // Register the background hosted service that runs the seeding process
+            services.AddHostedService<DbSeeder>();
+
+            return services;
+        }
+    }
+}
+
+
+===== Seeding/Tools/SeedingToolsProvider.cs =====
+using Ardalis.Specification;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.Extensions.Logging;
+using YuGiOh.Infrastructure.Seeding.Helpers;
+using YuGiOh.Infrastructure.Identity;
+using YuGiOh.Domain.Models;
+
+namespace YuGiOh.Infrastructure.Seeding.Tools
+{
+    public partial class SeedingToolsProvider
+    {
+        public readonly SeedTools<StreetType> StreetTypeSeedingTools;
+        public readonly SeedTools<IdentityRole> RoleSeedingTools;
+        public readonly SeedTools<Account> AccountSeedingTools;
+
+        public readonly List<object> SeedingTools;
+
+        private readonly ILoggerFactory _loggerFactory;
+
+        public SeedingToolsProvider(
+            RoleManager<IdentityRole> roleManager,
+            UserManager<Account> userManager,
+            IRepositoryBase<StreetType> streetTypeRepository,
+            ILoggerFactory loggerFactory
+        )
+        {
+            _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
+            StreetTypeSeedingTools = GenerateStreetTypesSeedingTools(streetTypeRepository);
+            RoleSeedingTools = GenerateRoleSeedingTools(roleManager);
+            AccountSeedingTools = GenerateAccountSeedingTools(userManager);
+            SeedingTools = new List<object>()
+            {
+                StreetTypeSeedingTools,
+                RoleSeedingTools,
+                AccountSeedingTools
+            };
+        }
+
+        protected SeedTools<IdentityRole> GenerateRoleSeedingTools(RoleManager<IdentityRole> roleManager)
+        {
+            return new SeedTools<IdentityRole>(
+                async () => (await JsonReaderWrapper.ResolveDataFromJson<string>("IdentityRole")).Select(role => new IdentityRole(role)),
+                role => roleManager.RoleExistsAsync(role.Name),
+                async roles => { foreach (var role in roles) await roleManager.CreateAsync(role); },
+                _loggerFactory.CreateLogger<SeedTools<IdentityRole>>()
+            );
+        }
+        protected SeedTools<StreetType> GenerateStreetTypesSeedingTools(IRepositoryBase<StreetType> staffRepository)
+        {
+            return new SeedTools<StreetType>(
+                async () => await JsonReaderWrapper.ResolveDataFromJson<StreetType>(),
+                async type => !(await staffRepository.GetByIdAsync(type.Id) == null),
+                async types => { foreach (var type in types) await staffRepository.AddAsync(type); },
+                _loggerFactory.CreateLogger<SeedTools<StreetType>>()
+                );
+        }
+        protected SeedTools<Account> GenerateAccountSeedingTools(UserManager<Account> userManager)
+        {
+            return new SeedTools<Account>(
+                async () => (await JsonReaderWrapper.ResolveDataFromJson<AccountDTO>()).Select(accountDTO => MapFromDTO(accountDTO, userManager)),
+                async account => !(await userManager.FindByNameAsync(account.UserName) == null),
+                async accounts =>
+                {
+                    foreach (var account in accounts)
+                    {
+                        string password = account.PasswordHash;
+                        account.PasswordHash = null;
+                        await userManager.CreateAsync(account, password);
+                        await userManager.AddToRoleAsync(account, "Admin");
+                    }
+                },
+                _loggerFactory.CreateLogger<SeedTools<Account>>()
+            );
+        }
+        private static Account MapFromDTO(AccountDTO account, UserManager<Account> userManager)
+        {
+            var newAccount = new Account
+            {
+                UserName = account.UserName,
+                PasswordHash = account.Password,
+                Email = account.Email,
+                EmailConfirmed = true
+            };
+            return newAccount;
+        }
+        public record AccountDTO
+        {
+            public string UserName { get; set; } = "";
+            public string Password { get; set; } = "";
+            public string Email { get; set; } = "";
+        }
+    }
+}
+
+===== Seeding/Tools/SeedTools.cs =====
+using Microsoft.Extensions.Logging;
+
+namespace YuGiOh.Infrastructure.Seeding.Tools
+{
+    public interface ISeeder
+    {
+        Task SeedAsync();
+    }
+    public class SeedTools<T> : ISeeder
+    {
+        public Func<Task<IEnumerable<T>>> Provide { get; }
+        public Func<T, Task<bool>> Filter { get; }
+        public Func<IEnumerable<T>, Task> Save { get; }
+        private readonly ILogger<SeedTools<T>> _logger;
+
+        public SeedTools
+        (
+            Func<Task<IEnumerable<T>>> provide,
+            Func<T, Task<bool>> filter,
+            Func<IEnumerable<T>, Task> save,
+            ILogger<SeedTools<T>> logger
+        )
+        {
+            Provide = provide;
+            Filter = filter;
+            Save = save;
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        public async Task SeedAsync()
+        {
+            {
+
+                var entities = await Provide();
+
+                var newEntities = new List<T>();
+                foreach (var entity in entities)
+                {
+                    bool exists = await Filter(entity);
+                    if (!exists)
+                        newEntities.Add(entity);
+                }
+
+                if (newEntities.Count > 0)
+                {
+                    await Save(newEntities);
+                    _logger.LogInformation($"🌱 Seeded {newEntities.Count} new {typeof(T).Name}(s).");
+                }
+                else
+                {
+                    _logger.LogInformation($"📭 No new {typeof(T).Name}(s) to seed.");
+                }
+            }
+        }
+    }
+}
+
+===== ServiceExtension.cs =====
+﻿using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using YuGiOh.Infrastructure.CachingService;
+using YuGiOh.Infrastructure.CSCService;
+using YuGiOh.Infrastructure.EmailService;
+using YuGiOh.Infrastructure.Identity;
+using YuGiOh.Infrastructure.Persistence;
+using YuGiOh.Infrastructure.Seeding;
+
+namespace YuGiOh.Infrastructure
+{
+    public static class ServiceExtension
+    {
+        public static IServiceCollection AddInfrastructureLayer
+        (
+            this IServiceCollection services,
+            IConfiguration configuration)
+        {
+            services.AddEmailService(configuration);
+            services.AddPersistence(configuration);
+            services.AddCachingService(configuration);
+            services.AddCSCService(configuration);
+            services.AddIdentityService(configuration);
+            services.AddSeeding();
+            return services;
+        }
+    }
+}
+
+
+===== YuGiOh.Infrastructure.csproj =====
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\YuGiOh.Domain\YuGiOh.Domain.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="MailKit" Version="4.13.0" />
+
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="7.0.20" />
+    <PackageReference Include="Microsoft.AspNetCore.Identity" Version="2.2.0" />
+    <PackageReference Include="Microsoft.AspNetCore.Identity.EntityFrameworkCore" Version="7.0.20" />
+    <PackageReference Include="Microsoft.AspNetCore.Identity.UI" Version="7.0.20" />
+
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+
+    
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="7.0.20" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Tools" Version="7.0.20">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="Ardalis.Specification.EntityFrameworkCore" Version="8.0.0" />
+
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="7.0.11" />
+    <PackageReference Include="StackExchange.Redis" Version="2.9.17" />
+
+
+  </ItemGroup>
+
+</Project>
+
+

@@ -1,0 +1,14 @@
+
+# .Net
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.DS_Store
+
+# Private Data
+*.Development.json
+
+#
+YuGiOh.Tests/

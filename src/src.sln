@@ -1,0 +1,42 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "YuGiOh.Application", "YuGiOh.Application\YuGiOh.Application.csproj", "{6A6E359D-3885-C2ED-BEDF-421A45E8DFE5}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "YuGiOh.Domain", "YuGiOh.Domain\YuGiOh.Domain.csproj", "{0BA6A99A-E1C9-281A-34B2-7AFA39CC5D41}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "YuGiOh.WebAPI", "YuGiOh.WebAPI\YuGiOh.WebAPI.csproj", "{49BE2AE5-F5F2-3DF6-ABA0-82D7BDB2B509}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "YuGiOh.Infrastructure", "YuGiOh.Infrastructure\YuGiOh.Infrastructure.csproj", "{DE12CC31-7B0C-D115-0823-44AD5B272EA2}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{6A6E359D-3885-C2ED-BEDF-421A45E8DFE5}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{6A6E359D-3885-C2ED-BEDF-421A45E8DFE5}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{6A6E359D-3885-C2ED-BEDF-421A45E8DFE5}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{6A6E359D-3885-C2ED-BEDF-421A45E8DFE5}.Release|Any CPU.Build.0 = Release|Any CPU
+		{0BA6A99A-E1C9-281A-34B2-7AFA39CC5D41}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{0BA6A99A-E1C9-281A-34B2-7AFA39CC5D41}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{0BA6A99A-E1C9-281A-34B2-7AFA39CC5D41}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{0BA6A99A-E1C9-281A-34B2-7AFA39CC5D41}.Release|Any CPU.Build.0 = Release|Any CPU
+		{49BE2AE5-F5F2-3DF6-ABA0-82D7BDB2B509}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{49BE2AE5-F5F2-3DF6-ABA0-82D7BDB2B509}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{49BE2AE5-F5F2-3DF6-ABA0-82D7BDB2B509}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{49BE2AE5-F5F2-3DF6-ABA0-82D7BDB2B509}.Release|Any CPU.Build.0 = Release|Any CPU
+		{DE12CC31-7B0C-D115-0823-44AD5B272EA2}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{DE12CC31-7B0C-D115-0823-44AD5B272EA2}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{DE12CC31-7B0C-D115-0823-44AD5B272EA2}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{DE12CC31-7B0C-D115-0823-44AD5B272EA2}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {868A1F8C-138D-41DC-AFED-32901EECEDC5}
+	EndGlobalSection
+EndGlobal

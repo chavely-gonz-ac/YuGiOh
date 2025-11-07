@@ -1,0 +1,924 @@
+===== DTOs/CSC.cs =====
+using System.Text.Json.Serialization;
+
+namespace YuGiOh.Domain.DTOs
+{
+    /// <summary>
+    /// Represents a country returned by the CSC (Country–State–City) API.
+    /// </summary>
+    public class Country
+    {
+        /// <summary>
+        /// Gets or sets the ISO 3166-1 alpha-2 country code (e.g., "US", "MX", "JP").
+        /// </summary>
+        [JsonPropertyName("iso2")]
+        public required string Iso2 { get; set; }
+
+        /// <summary>
+        /// Gets or sets the human-readable name of the country.
+        /// </summary>
+        [JsonPropertyName("name")]
+        public required string Name { get; set; }
+
+        /// <summary>
+        /// Returns a compact string representation of the country in the format "ISO2:Name".
+        /// </summary>
+        public override string ToString() => $"{Iso2}:{Name}";
+    }
+
+    /// <summary>
+    /// Represents a state or province returned by the CSC API.
+    /// </summary>
+    public class State
+    {
+        /// <summary>
+        /// Gets or sets the ISO 3166-2 state code (e.g., "CA", "NY").
+        /// </summary>
+        [JsonPropertyName("iso2")]
+        public required string Iso2 { get; set; }
+
+        /// <summary>
+        /// Gets or sets the human-readable name of the state or province.
+        /// </summary>
+        [JsonPropertyName("name")]
+        public required string Name { get; set; }
+
+        /// <summary>
+        /// Gets or sets the ISO2 code of the country this state belongs to.
+        /// </summary>
+        [JsonPropertyName("country_code")]
+        public required string CountryIso2 { get; set; }
+
+        /// <summary>
+        /// Returns a compact string representation of the state in the format "CountryIso2:Iso2:Name".
+        /// </summary>
+        public override string ToString() => $"{CountryIso2}:{Iso2}:{Name}";
+    }
+
+    /// <summary>
+    /// Represents a city returned by the CSC API.
+    /// </summary>
+    public class City
+    {
+        /// <summary>
+        /// Gets or sets the name of the city.
+        /// </summary>
+        [JsonPropertyName("name")]
+        public required string Name { get; set; }
+
+        /// <summary>
+        /// Gets or sets the ISO2 code of the state this city belongs to.
+        /// </summary>
+        [JsonPropertyName("state_code")]
+        public required string StateIso2 { get; set; }
+
+        /// <summary>
+        /// Gets or sets the ISO2 code of the country this city belongs to.
+        /// </summary>
+        [JsonPropertyName("country_code")]
+        public required string CountryIso2 { get; set; }
+
+        /// <summary>
+        /// Returns a compact string representation of the city in the format "CountryIso2:StateIso2:Name".
+        /// </summary>
+        public override string ToString() => $"{CountryIso2}:{StateIso2}:{Name}";
+    }
+}
+
+
+===== DTOs/EmailMessageDTO.cs =====
+namespace YuGiOh.Domain.DTOs
+{
+    /// <summary>
+    /// Represents the content of an email message to be sent through the system.
+    /// </summary>
+    public class EmailMessageDTO
+    {
+        /// <summary>
+        /// Gets or sets the destination email address of the recipient.
+        /// </summary>
+        public required string ToAddress { get; set; }
+
+        /// <summary>
+        /// Gets or sets the subject line of the email.
+        /// </summary>
+        public required string Subject { get; set; }
+
+        /// <summary>
+        /// Gets or sets the main content of the email message.
+        /// </summary>
+        public required string Body { get; set; }
+
+        /// <summary>
+        /// Indicates whether the email content is formatted as HTML.
+        /// If false, the message body will be treated as plain text.
+        /// </summary>
+        public bool IsHTML { get; set; }
+
+        /// <summary>
+        /// Optional plain-text version of the email body, used for non-HTML email clients.
+        /// </summary>
+        public string? PlainTextBody { get; set; }
+    }
+}
+
+
+===== DTOs/RegisterRequestData.cs =====
+using System.Text.RegularExpressions;
+using YuGiOh.Domain.Models;
+
+namespace YuGiOh.Domain.DTOs
+{
+    /// <summary>
+    /// Represents the data required to register a new user in the system.
+    /// </summary>
+    public class RegisterRequestData
+    {
+        /// <summary>
+        /// Gets or sets the user's first name.  
+        /// Must contain only Latin letters (validated in the application layer).
+        /// </summary>
+        public required string FirstName { get; set; }
+
+        /// <summary>
+        /// Gets or sets the user's middle name (optional).  
+        /// Must contain only Latin letters if provided.
+        /// </summary>
+        public string? MiddleName { get; set; }
+
+        /// <summary>
+        /// Gets or sets the user's first surname.  
+        /// Must contain only Latin letters.
+        /// </summary>
+        public required string FirstSurname { get; set; }
+
+        /// <summary>
+        /// Gets or sets the user's second surname.  
+        /// Must contain only Latin letters.
+        /// </summary>
+        public required string SecondSurname { get; set; }
+
+        /// <summary>
+        /// Gets the user's full name in a normalized form, 
+        /// where each name component is trimmed and separated by '0'.  
+        /// Example: <c>John0Michael0Doe0Smith</c>
+        /// </summary>
+        public string FullName
+        {
+            get
+            {
+                if (string.IsNullOrWhiteSpace(MiddleName))
+                    return $"{FirstName.Trim()}0{FirstSurname.Trim()}0{SecondSurname.Trim()}";
+                else
+                    return $"{FirstName.Trim()}0{MiddleName.Trim()}0{FirstSurname.Trim()}0{SecondSurname.Trim()}";
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the user's email address.
+        /// </summary>
+        public required string Email { get; set; }
+
+        /// <summary>
+        /// Gets or sets the user's password.  
+        /// Complexity and format are validated in the application layer.
+        /// </summary>
+        public required string Password { get; set; }
+
+        /// <summary>
+        /// Gets or sets the list of roles assigned to the user during registration.
+        /// </summary>
+        public IEnumerable<string> Roles { get; set; } = Enumerable.Empty<string>();
+
+        /// <summary>
+        /// Gets or sets the user's address information (optional).
+        /// </summary>
+        public Address? Address { get; set; }
+
+        /// <summary>
+        /// Gets or sets the user's International Bank Account Number (optional).
+        /// </summary>
+        public string? IBAN { get; set; }
+
+        // ---------------------------------------------------------------------
+
+        /// <summary>
+        /// Attempts to parse a normalized full name string (using '0' as a separator)
+        /// into its name components.
+        /// </summary>
+        /// <param name="fullName">The normalized full name string from storage.</param>
+        /// <param name="names">The resulting name tuple, if parsing succeeds.</param>
+        /// <returns><c>true</c> if the format is valid and parsing succeeded; otherwise <c>false</c>.</returns>
+        public static bool TryParseFullName(
+            string fullName,
+            out (string FirstName, string? MiddleName, string FirstSurname, string SecondSurname) names)
+        {
+            names = default;
+
+            if (string.IsNullOrWhiteSpace(fullName))
+                return false;
+
+            // Split using '0' as delimiter
+            var parts = fullName.Split('0', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+            // Valid combinations: 3 parts (no middle name) or 4 parts (with middle name)
+            if (parts.Length == 3)
+            {
+                names = (parts[0], null, parts[1], parts[2]);
+                return true;
+            }
+            else if (parts.Length == 4)
+            {
+                names = (parts[0], parts[1], parts[2], parts[3]);
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Checks whether a full name string follows the correct normalized format:
+        /// 3 or 4 name parts separated by '0', each containing only Latin letters.
+        /// </summary>
+        public static bool IsValidFullNameFormat(string fullName)
+        {
+            if (string.IsNullOrWhiteSpace(fullName))
+                return false;
+
+            var parts = fullName.Split('0', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length is < 3 or > 4) return false;
+
+            return parts.All(p => Regex.IsMatch(p, @"^[A-Za-z]+$"));
+        }
+    }
+}
+
+
+===== Exceptions/APIException.cs =====
+using System.Net;
+
+namespace YuGiOh.Domain.Exceptions
+{
+    /// <summary>
+    /// Represents an error that occurs during the execution of an API request.
+    /// Provides a standardized structure for exception handling and responses.
+    /// </summary>
+    public class APIException : Exception
+    {
+        /// <summary>
+        /// Gets the HTTP status code associated with this exception.
+        /// </summary>
+        public HttpStatusCode StatusCode { get; }
+
+        /// <summary>
+        /// Gets a short, human-readable title describing the type of error.
+        /// </summary>
+        public string Title { get; }
+
+        /// <summary>
+        /// Gets an optional additional detail message that may assist in debugging.
+        /// </summary>
+        public string? Detail { get; }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="APIException"/> class.
+        /// </summary>
+        /// <param name="statusCode">The HTTP status code to return (default: 500).</param>
+        /// <param name="message">The main message describing the error.</param>
+        /// <param name="title">A short title for the error (default: "API Error").</param>
+        /// <param name="detail">Optional additional detail message.</param>
+        /// <param name="innerException">Optional inner exception for debugging.</param>
+        public APIException(
+            HttpStatusCode statusCode = HttpStatusCode.InternalServerError,
+            string message = "An unexpected error occurred.",
+            string title = "API Error",
+            string? detail = null,
+            Exception? innerException = null
+        ) : base(message, innerException)
+        {
+            StatusCode = statusCode;
+            Title = title;
+            Detail = detail;
+        }
+
+        /// <summary>
+        /// Converts this exception into a serializable object that can be returned by the API layer.
+        /// Keeps it decoupled from ASP.NET MVC or other frameworks.
+        /// </summary>
+        /// <param name="includeInnerException">Whether to include inner exception details.</param>
+        public object ToSerializableObject(bool includeInnerException = false)
+        {
+            var obj = new Dictionary<string, object?>
+            {
+                ["status"] = (int)StatusCode,
+                ["title"] = Title,
+                ["message"] = Message,
+                ["detail"] = Detail,
+                ["timestamp"] = DateTime.UtcNow
+            };
+
+            if (includeInnerException && InnerException is not null)
+                obj["innerException"] = InnerException.Message;
+
+            return obj;
+        }
+
+        // === Factory methods ===
+
+        public static APIException BadRequest(string message, string? detail = null, Exception? innerException = null)
+            => new(HttpStatusCode.BadRequest, message, "Bad Request", detail, innerException);
+
+        public static APIException NotFound(string message, string? detail = null, Exception? innerException = null)
+            => new(HttpStatusCode.NotFound, message, "Not Found", detail, innerException);
+
+        public static APIException Unauthorized(string message = "Unauthorized access.", string? detail = null, Exception? innerException = null)
+            => new(HttpStatusCode.Unauthorized, message, "Unauthorized", detail, innerException);
+
+        public static APIException Forbidden(string message = "Access forbidden.", string? detail = null, Exception? innerException = null)
+            => new(HttpStatusCode.Forbidden, message, "Forbidden", detail, innerException);
+
+        public static APIException Internal(string message = "An internal server error occurred.", string? detail = null, Exception? innerException = null)
+            => new(HttpStatusCode.InternalServerError, message, "Internal Server Error", detail, innerException);
+    }
+}
+
+
+===== Models/Address.cs =====
+namespace YuGiOh.Domain.Models
+{
+    /// <summary>
+    /// Represents a physical address used by players in the Yu-Gi-Oh! system.
+    /// </summary>
+    public class Address
+    {
+        /// <summary>
+        /// Gets or sets the unique identifier for the address.
+        /// </summary>
+        public int Id { get; set; }
+
+        /// <summary>
+        /// Gets or sets the ISO2 country code (e.g., "US", "MX", "ES").
+        /// </summary>
+        public required string CountryIso2 { get; set; }
+
+        /// <summary>
+        /// Gets or sets the ISO2 state code (optional).
+        /// </summary>
+        public string? StateIso2 { get; set; }
+
+        /// <summary>
+        /// Gets or sets the city name (optional).
+        /// </summary>
+        public string? City { get; set; }
+
+        /// <summary>
+        /// Gets or sets the foreign key for the street type (optional).
+        /// </summary>
+        public int? StreetTypeId { get; set; }
+
+        /// <summary>
+        /// Gets or sets the street type (e.g., "Street", "Avenue", etc.).
+        /// </summary>
+        public StreetType? StreetType { get; set; }
+
+        /// <summary>
+        /// Gets or sets the name of the street (optional).
+        /// </summary>
+        public string? StreetName { get; set; }
+
+        /// <summary>
+        /// Gets or sets the building name or number (optional).
+        /// </summary>
+        public string? Building { get; set; }
+
+        /// <summary>
+        /// Gets or sets the apartment or unit identifier (optional).
+        /// </summary>
+        public string? Apartment { get; set; }
+
+        /// <summary>
+        /// Gets or sets the players associated with this address.
+        /// </summary>
+        public ICollection<Player> Players { get; set; } = new List<Player>();
+
+        /// <summary>
+        /// Returns a readable representation of the address.
+        /// </summary>
+        public override string ToString()
+        {
+            var parts = new List<string?> { StreetName, Building, Apartment, City, StateIso2, CountryIso2 };
+            return string.Join(", ", parts.Where(p => !string.IsNullOrWhiteSpace(p)));
+        }
+    }
+}
+
+
+===== Models/HasIBAN.cs =====
+namespace YuGiOh.Domain.Models
+{
+    /// <summary>
+    /// Represents an entity (staff, sponsor, or admin)
+    /// that is associated with a financial account (IBAN)
+    /// for transactions, payments, or revenue distribution.
+    /// </summary>
+    public class HasIBAN
+    {
+        /// <summary>
+        /// Gets or sets the unique identifier of this entity.
+        /// This corresponds to the <c>Account.Id</c> from the identity system.
+        /// </summary>
+        public required string Id { get; set; }
+
+        /// <summary>
+        /// Gets or sets the International Bank Account Number (IBAN)
+        /// used for receiving or sending funds.
+        /// </summary>
+        public required string IBAN { get; set; }
+
+        /// <summary>
+        /// Returns a readable string representation of this entity.
+        /// </summary>
+        public override string ToString() => $"{Id}:{IBAN}";
+    }
+}
+
+
+===== Models/Player.cs =====
+namespace YuGiOh.Domain.Models
+{
+    /// <summary>
+    /// Represents a player in the Yu-Gi-Oh! system.
+    /// Each player corresponds to an account in the identity system,
+    /// but this entity remains domain-pure and unaware of Identity.
+    /// </summary>
+    public class Player
+    {
+        /// <summary>
+        /// Gets or sets the unique identifier of the player.
+        /// This value corresponds to the <c>Account.Id</c> from the identity layer.
+        /// </summary>
+        public required string Id { get; set; }
+
+        /// <summary>
+        /// Gets or sets the foreign key to the player's address.
+        /// </summary>
+        public int AddressId { get; set; }
+
+        /// <summary>
+        /// Gets or sets the player's address information.
+        /// </summary>
+        public Address? Address { get; set; }
+
+        /// <summary>
+        /// Returns the string representation of the player (its ID).
+        /// </summary>
+        public override string ToString() => Id;
+    }
+}
+
+
+===== Models/RefreshTokenData.cs =====
+namespace YuGiOh.Domain.Models
+{
+    /// <summary>
+    /// Represents a persisted refresh token associated with an account.
+    /// Used to manage authentication sessions, handle token rotation,
+    /// and track revocation for security auditing.
+    /// </summary>
+    public class RefreshTokenData
+    {
+        /// <summary>
+        /// Gets or sets the unique token string.
+        /// </summary>
+        public required string Token { get; set; }
+
+        /// <summary>
+        /// Gets or sets the identifier of the account that owns this token.
+        /// </summary>
+        public required string AccountId { get; set; }
+
+        /// <summary>
+        /// Gets or sets the UTC datetime when this token will expire.
+        /// </summary>
+        public DateTime Expires { get; set; }
+
+        /// <summary>
+        /// Gets or sets the UTC datetime when this token was created.
+        /// </summary>
+        public DateTime Created { get; set; } = DateTime.UtcNow;
+
+        /// <summary>
+        /// Gets or sets the IP address from which the token was created.
+        /// </summary>
+        public required string CreatedByIp { get; set; }
+
+        /// <summary>
+        /// Gets or sets the UTC datetime when this token was revoked, if applicable.
+        /// </summary>
+        public DateTime? Revoked { get; set; }
+
+        /// <summary>
+        /// Gets or sets the IP address from which the token was revoked.
+        /// </summary>
+        public string? RevokedByIp { get; set; }
+
+        /// <summary>
+        /// Gets or sets the replacement token string if this token was rotated.
+        /// </summary>
+        public string? ReplacedByToken { get; set; }
+
+        /// <summary>
+        /// Gets a value indicating whether the token has expired.
+        /// </summary>
+        public bool IsExpired => DateTime.UtcNow >= Expires;
+
+        /// <summary>
+        /// Gets a value indicating whether the token is still active (not expired or revoked).
+        /// </summary>
+        public bool IsActive => Revoked == null && !IsExpired;
+
+        /// <summary>
+        /// Returns the string representation of the token (for debugging).
+        /// </summary>
+        public override string ToString() => $"{Token} (Active: {IsActive})";
+    }
+}
+
+
+===== Models/Sponsor.cs =====
+// namespace YuGiOh.Domain.Models
+// {
+//     public class Sponsor
+//     {
+//         public IEnumerable<Tournaments> Tournaments { get; set;}
+//     }
+// }
+
+===== Models/Staff.cs =====
+// namespace YuGiOh.Domain.Models
+// {
+//     public class Staff
+//     {
+//         public float Salary { get; set; }
+//     }
+// }
+
+===== Models/StreetType.cs =====
+namespace YuGiOh.Domain.Models
+{
+    /// <summary>
+    /// Represents a type of street used in address information,
+    /// such as "Street", "Avenue", or "Boulevard".
+    /// </summary>
+    public class StreetType
+    {
+        /// <summary>
+        /// Gets or sets the unique identifier for the street type.
+        /// </summary>
+        public int Id { get; set; }
+
+        public required string Language { get; set; }
+
+        /// <summary>
+        /// Gets or sets the name of the street type.  
+        /// Example values: "Street", "Avenue", "Road", "Boulevard".
+        /// </summary>
+        public required string Name { get; set; }
+
+        /// <summary>
+        /// Returns the string representation of the street type (its name).
+        /// </summary>
+        public override string ToString() => Name;
+    }
+}
+
+
+===== obj/Debug/net7.0/.NETCoreApp,Version=v7.0.AssemblyAttributes.cs =====
+// <autogenerated />
+using System;
+using System.Reflection;
+[assembly: global::System.Runtime.Versioning.TargetFrameworkAttribute(".NETCoreApp,Version=v7.0", FrameworkDisplayName = ".NET 7.0")]
+
+
+===== obj/Debug/net7.0/YuGiOh.Domain.AssemblyInfo.cs =====
+//------------------------------------------------------------------------------
+// <auto-generated>
+//     This code was generated by a tool.
+//
+//     Changes to this file may cause incorrect behavior and will be lost if
+//     the code is regenerated.
+// </auto-generated>
+//------------------------------------------------------------------------------
+
+using System;
+using System.Reflection;
+
+[assembly: System.Reflection.AssemblyCompanyAttribute("YuGiOh.Domain")]
+[assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
+[assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyProductAttribute("YuGiOh.Domain")]
+[assembly: System.Reflection.AssemblyTitleAttribute("YuGiOh.Domain")]
+[assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
+
+// Generated by the MSBuild WriteCodeFragment class.
+
+
+
+===== obj/Debug/net7.0/YuGiOh.Domain.GlobalUsings.g.cs =====
+// <auto-generated/>
+global using global::System;
+global using global::System.Collections.Generic;
+global using global::System.IO;
+global using global::System.Linq;
+global using global::System.Net.Http;
+global using global::System.Threading;
+global using global::System.Threading.Tasks;
+
+
+===== Repositories/ICachingRepository.cs =====
+namespace YuGiOh.Domain.Repositories
+{
+    /// <summary>
+    /// Provides a generic abstraction for caching operations that can be implemented
+    /// using in-memory or distributed providers such as Redis.
+    /// </summary>
+    public interface ICachingRepository
+    {
+        /// <summary>
+        /// Stores a value in the cache with an optional expiration time.
+        /// </summary>
+        /// <typeparam name="T">The type of the value to store.</typeparam>
+        /// <param name="key">The cache key used to identify the entry.</param>
+        /// <param name="value">The value to store.</param>
+        /// <param name="expiry">Optional expiration time (TTL).</param>
+        Task SetAsync<T>(string key, T value, TimeSpan? expiry = null);
+
+        /// <summary>
+        /// Retrieves a cached value by its key.
+        /// </summary>
+        /// <typeparam name="T">The expected type of the cached value.</typeparam>
+        /// <param name="key">The cache key.</param>
+        /// <returns>The cached value or <c>null</c> if not found.</returns>
+        Task<T?> GetAsync<T>(string key);
+
+        /// <summary>
+        /// Retrieves a cached value or creates it using the provided factory function if not found.
+        /// </summary>
+        /// <typeparam name="T">The type of the value.</typeparam>
+        /// <param name="key">The cache key.</param>
+        /// <param name="factory">A function that produces the value if it is not cached.</param>
+        /// <param name="expiry">Optional expiration time for the newly cached value.</param>
+        /// <returns>The existing or newly created cached value.</returns>
+        Task<T> GetOrCreateAsync<T>(string key, Func<Task<T>> factory, TimeSpan? expiry = null);
+
+        /// <summary>
+        /// Removes a cached entry by its key.
+        /// </summary>
+        /// <typeparam name="T">The type of the cached value.</typeparam>
+        /// <param name="key">The cache key.</param>
+        Task RemoveAsync<T>(string key);
+
+        /// <summary>
+        /// Determines whether a cached entry exists for the specified key.
+        /// </summary>
+        /// <typeparam name="T">The type of the cached value.</typeparam>
+        /// <param name="key">The cache key.</param>
+        /// <returns><c>true</c> if the key exists in the cache; otherwise, <c>false</c>.</returns>
+        Task<bool> ExistsAsync<T>(string key);
+
+        /// <summary>
+        /// Executes a query that retrieves a collection from cache or from the provided loader if missing.
+        /// Optionally filters the cached or loaded results and stores them with an optional TTL.
+        /// </summary>
+        /// <typeparam name="T">The type of objects being cached.</typeparam>
+        /// <param name="predicate">The filter to apply to cached or loaded data.</param>
+        /// <param name="loader">A factory function to load data if not available in cache.</param>
+        /// <param name="ttl">Optional time-to-live for cached data.</param>
+        /// <param name="cacheKey">Optional cache key; if not provided, one should be derived internally.</param>
+        /// <returns>A filtered collection of cached or freshly loaded items.</returns>
+        Task<ICollection<T>> GroupQuery<T>(
+            Func<T, bool> predicate,
+            Func<Task<ICollection<T>>> loader,
+            TimeSpan? ttl = null,
+            string? cacheKey = null);
+    }
+}
+
+
+===== Services/IAccountTokensProvider.cs =====
+using YuGiOh.Domain.Models;
+
+namespace YuGiOh.Domain.Services
+{
+    /// <summary>
+    /// Provides functionality for generating, storing, and managing authentication tokens.
+    /// Includes operations for JWT and refresh token management.
+    /// </summary>
+    public interface IAccountTokensProvider
+    {
+        /// <summary>
+        /// Generates a JSON Web Token (JWT) for the specified account.
+        /// </summary>
+        /// <param name="accountId">The unique identifier of the account.</param>
+        /// <returns>A signed JWT as a string.</returns>
+        Task<string> GenerateJWTokenAsync(string accountId);
+
+        /// <summary>
+        /// Creates and stores a new refresh token associated with the specified account ID and IP address.
+        /// </summary>
+        /// <param name="accountId">The unique identifier of the account.</param>
+        /// <param name="ipAddress">The IP address from which the token was generated.</param>
+        /// <returns>The newly created refresh token string.</returns>
+        Task<string> AddRefreshTokenByIdAsync(string accountId, string ipAddress);
+
+        /// <summary>
+        /// Creates a new refresh token by rotating (replacing) an existing one.
+        /// </summary>
+        /// <param name="oldToken">The old refresh token being replaced.</param>
+        /// <param name="ipAddress">The IP address from which the request originated.</param>
+        /// <returns>The new refresh token string.</returns>
+        Task<string> AddRefreshTokenAsync(string oldToken, string ipAddress);
+
+        /// <summary>
+        /// Revokes a specific refresh token, preventing further use.
+        /// </summary>
+        /// <param name="token">The refresh token to revoke.</param>
+        /// <param name="ipAddress">The IP address that performed the revocation.</param>
+        Task RevokeRefreshTokenAsync(string token, string ipAddress);
+
+        /// <summary>
+        /// Retrieves the refresh token metadata and validation information by token value.
+        /// </summary>
+        /// <param name="token">The token to search for.</param>
+        /// <returns>The refresh token data if found; otherwise, <c>null</c>.</returns>
+        Task<RefreshTokenData?> GetRefreshTokenDataAsync(string token);
+    }
+}
+
+
+===== Services/IAuthenticationHandler.cs =====
+namespace YuGiOh.Domain.Services
+{
+    /// <summary>
+    /// Defines authentication and token refresh operations.
+    /// </summary>
+    public interface IAuthenticationHandler
+    {
+        /// <summary>
+        /// Authenticates a user based on their identifier and password,
+        /// returning a new access token and refresh token if successful.
+        /// </summary>
+        /// <param name="identifier">
+        /// The unique login identifier of the account (e.g., username or email).
+        /// </param>
+        /// <param name="password">The user's password.</param>
+        /// <param name="ipAddress">
+        /// The IP address from which the authentication request originated.
+        /// </param>
+        /// <returns>
+        /// A tuple containing the generated <c>AccessToken</c> and <c>RefreshToken</c>.
+        /// </returns>
+        Task<(string AccessToken, string RefreshToken)> AuthenticateAsync(
+            string identifier, string password, string ipAddress);
+
+        /// <summary>
+        /// Refreshes an existing access token using a valid refresh token.
+        /// </summary>
+        /// <param name="refreshToken">The refresh token used to generate a new pair of tokens.</param>
+        /// <param name="ipAddress">The IP address from which the request originated.</param>
+        /// <returns>
+        /// A tuple containing a new <c>AccessToken</c> and <c>RefreshToken</c>.
+        /// </returns>
+        Task<(string AccessToken, string RefreshToken)> RefreshAsync(
+            string refreshToken, string ipAddress);
+    }
+}
+
+
+===== Services/ICSCProvider.cs =====
+using YuGiOh.Domain.DTOs;
+using YuGiOh.Domain.Models;
+
+namespace YuGiOh.Domain.Services
+{
+    /// <summary>
+    /// Provides country, state, city, and street type data from an external or local source.
+    /// Abstracts access to geographical information services.
+    /// </summary>
+    public interface ICSCProvider
+    {
+        /// <summary>
+        /// Retrieves all available countries.
+        /// </summary>
+        /// <returns>A collection of country DTOs.</returns>
+        Task<ICollection<Country>> GetAllCountriesAsync();
+
+        /// <summary>
+        /// Retrieves the states associated with the specified country.
+        /// </summary>
+        /// <param name="countryIso2">The ISO2 code of the country.</param>
+        /// <returns>A collection of state DTOs for the given country.</returns>
+        Task<ICollection<State>> GetStatesByCountryAsync(string countryIso2);
+
+        /// <summary>
+        /// Retrieves the cities within a specific state and country.
+        /// </summary>
+        /// <param name="countryIso2">The ISO2 code of the country.</param>
+        /// <param name="stateIso2">The ISO2 code of the state.</param>
+        /// <returns>A collection of city DTOs for the given state.</returns>
+        Task<ICollection<City>> GetCitiesByStateAsync(string countryIso2, string stateIso2);
+
+        /// <summary>
+        /// Retrieves available street types (e.g., "Street", "Avenue", "Road").
+        /// </summary>
+        /// <returns>A collection of street type domain entities.</returns>
+        Task<ICollection<StreetType>> GetStreetTypesAsync();
+    }
+}
+
+
+===== Services/IEmailProvider.cs =====
+using YuGiOh.Domain.DTOs;
+
+namespace YuGiOh.Domain.Services
+{
+    /// <summary>
+    /// Provides functionality for generating structured email messages
+    /// based on specific system events or user actions.
+    /// </summary>
+    public interface IEmailProvider
+    {
+        /// <summary>
+        /// Generates an email message to confirm user registration.
+        /// </summary>
+        /// <param name="email">The recipient's email address.</param>
+        /// <param name="callbackURL">The URL the user should follow to confirm registration.</param>
+        /// <returns>A structured <see cref="EmailMessageDTO"/> representing the confirmation email.</returns>
+        EmailMessageDTO GenerateConfirmRegistrationEmail(string email, string callbackURL);
+    }
+}
+
+
+===== Services/IEmailSender.cs =====
+using YuGiOh.Domain.DTOs;
+
+namespace YuGiOh.Domain.Services
+{
+    /// <summary>
+    /// Defines a contract for sending email messages asynchronously.
+    /// </summary>
+    public interface IEmailSender
+    {
+        /// <summary>
+        /// Sends an email message asynchronously using the configured delivery mechanism.
+        /// </summary>
+        /// <param name="emailData">The structured email message to send.</param>
+        Task SendMailAsync(EmailMessageDTO emailData);
+    }
+}
+
+
+===== Services/IRegisterHandler.cs =====
+using YuGiOh.Domain.DTOs;
+
+namespace YuGiOh.Domain.Services
+{
+    /// <summary>
+    /// Defines the contract for handling user registration and confirmation processes.
+    /// </summary>
+    public interface IRegisterHandler
+    {
+        /// <summary>
+        /// Registers a new user based on the provided registration data.
+        /// </summary>
+        /// <param name="data">The registration data containing user and address details.</param>
+        /// <returns>
+        /// A string representing a result of the registration, typically a confirmation token
+        /// or unique identifier of the newly created account.
+        /// </returns>
+        Task<string> RegisterUserAsync(RegisterRequestData data);
+
+        /// <summary>
+        /// Confirms a user registration using the provided email and confirmation token.
+        /// </summary>
+        /// <param name="email">The email address of the account to confirm.</param>
+        /// <param name="token">The token used to verify the email ownership.</param>
+        /// <returns><c>true</c> if the registration was successfully confirmed; otherwise, <c>false</c>.</returns>
+        Task<bool> ConfirmRegistrationAsync(string email, string token);
+    }
+}
+
+
+===== YuGiOh.Domain.csproj =====
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
+
+
