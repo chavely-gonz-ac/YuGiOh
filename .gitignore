@@ -10,5 +10,8 @@ obj/
 # Private Data
 *.Development.json
 
-#
+# Unordered Tests
 YuGiOh.Tests/
+
+# recover data
+recover_data/
