@@ -24,6 +24,14 @@ namespace YuGiOh.Domain.Models
         public Address? Address { get; set; }
 
         /// <summary>
+        /// Collection of Decks associated with this Player.
+        /// </summary>
+        /// <remarks>
+        /// One Player can have many Decks. This represents the one-to-many relationship.
+        /// </remarks>
+        public ICollection<Deck> Decks { get; set; } = new List<Deck>();
+
+        /// <summary>
         /// Returns the string representation of the player (its ID).
         /// </summary>
         public override string ToString() => Id;

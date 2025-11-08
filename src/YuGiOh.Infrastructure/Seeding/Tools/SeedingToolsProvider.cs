@@ -12,6 +12,7 @@ namespace YuGiOh.Infrastructure.Seeding.Tools
         public readonly SeedTools<StreetType> StreetTypeSeedingTools;
         public readonly SeedTools<IdentityRole> RoleSeedingTools;
         public readonly SeedTools<Account> AccountSeedingTools;
+        public readonly SeedTools<Archetype> ArchetypeSeedingTools;
 
         public readonly List<object> SeedingTools;
 
@@ -21,6 +22,7 @@ namespace YuGiOh.Infrastructure.Seeding.Tools
             RoleManager<IdentityRole> roleManager,
             UserManager<Account> userManager,
             IRepositoryBase<StreetType> streetTypeRepository,
+            IRepositoryBase<Archetype> archetypeRepository,
             ILoggerFactory loggerFactory
         )
         {
@@ -28,12 +30,24 @@ namespace YuGiOh.Infrastructure.Seeding.Tools
             StreetTypeSeedingTools = GenerateStreetTypesSeedingTools(streetTypeRepository);
             RoleSeedingTools = GenerateRoleSeedingTools(roleManager);
             AccountSeedingTools = GenerateAccountSeedingTools(userManager);
+            ArchetypeSeedingTools = GenerateArchetypeSeedingTools(archetypeRepository);
             SeedingTools = new List<object>()
             {
                 StreetTypeSeedingTools,
                 RoleSeedingTools,
-                AccountSeedingTools
+                AccountSeedingTools,
+                ArchetypeSeedingTools
             };
+        }
+
+        private SeedTools<Archetype>? GenerateArchetypeSeedingTools(IRepositoryBase<Archetype> archetypeRepository)
+        {
+            return new SeedTools<Archetype>(
+                ArchetypesProvider.FetchArchetypesFromWebAsync,
+                async type => await archetypeRepository.AnyAsync(new ArchetypeByNameSpec(type.Name)),
+                async types => { foreach (var type in types) await archetypeRepository.AddAsync(type); },
+                _loggerFactory.CreateLogger<SeedTools<Archetype>>()
+                );
         }
 
         protected SeedTools<IdentityRole> GenerateRoleSeedingTools(RoleManager<IdentityRole> roleManager)
@@ -88,6 +102,16 @@ namespace YuGiOh.Infrastructure.Seeding.Tools
             public string UserName { get; set; } = "";
             public string Password { get; set; } = "";
             public string Email { get; set; } = "";
+        }
+
+        public sealed class ArchetypeByNameSpec : Specification<Archetype>
+        {
+            public ArchetypeByNameSpec(string name)
+            {
+                // simple case-insensitive match by normalizing to lower
+                var lowered = name?.Trim().ToLowerInvariant() ?? string.Empty;
+                Query.Where(a => a.Name.ToLower() == lowered);
+            }
         }
     }
 }

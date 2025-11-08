@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 using YuGiOh.Infrastructure.Persistence;
@@ -11,9 +12,11 @@ using YuGiOh.Infrastructure.Persistence;
 namespace YuGiOh.Infrastructure.Migrations
 {
     [DbContext(typeof(YuGiOhDbContext))]
-    partial class YuGiOhDbContextModelSnapshot : ModelSnapshot
+    [Migration("20251108203210_AddingArchetypeNameRestriction")]
+    partial class AddingArchetypeNameRestriction
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder

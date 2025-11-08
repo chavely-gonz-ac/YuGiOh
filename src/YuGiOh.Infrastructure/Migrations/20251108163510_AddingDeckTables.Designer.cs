@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 using YuGiOh.Infrastructure.Persistence;
@@ -11,9 +12,11 @@ using YuGiOh.Infrastructure.Persistence;
 namespace YuGiOh.Infrastructure.Migrations
 {
     [DbContext(typeof(YuGiOhDbContext))]
-    partial class YuGiOhDbContextModelSnapshot : ModelSnapshot
+    [Migration("20251108163510_AddingDeckTables")]
+    partial class AddingDeckTables
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -209,9 +212,6 @@ namespace YuGiOh.Infrastructure.Migrations
                         .HasColumnType("character varying(100)");
 
                     b.HasKey("Id");
-
-                    b.HasIndex("Name")
-                        .IsUnique();
 
                     b.ToTable("Archetypes", (string)null);
                 });

@@ -64,7 +64,7 @@ namespace YuGiOh.WebAPI.Controllers
                 // Return the access token to the client (refresh token remains in the cookie)
                 return Ok(new
                 {
-                    AccessToken = tokens.AccessToken
+                    tokens.AccessToken
                 });
             }
             catch (Exception ex)
