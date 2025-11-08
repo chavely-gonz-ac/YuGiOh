@@ -119,6 +119,6 @@ All domain-level operations are abstracted via interfaces in `YuGiOh.Domain.Serv
 
 Backend Junior Developer | .NET & Clean Architecture
 
-📧 [chavely.gonz.acl@example.com]
+📧 [chavely.gonz.ac@example.com]
 
 ---
