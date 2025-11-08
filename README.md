@@ -81,17 +81,13 @@ All rules are enforced before command execution via the MediatR validation behav
 
 -**Roles**
 
--**Decks** (structure, archetype, card counts)
-
--**Tournaments** (concept defined in Domain layer for future expansion)
-
 All domain-level operations are abstracted via interfaces in `YuGiOh.Domain.Services`.
 
 ---
 
 ### ⚙️ Developer Experience
 
--**Dependency Injection** configured in `ServiceExtension.AddApplicationLayer()`.
+-**Dependency Injection** configured.
 
 -**Automatic Validator Discovery** via reflection.
 
@@ -123,6 +119,6 @@ All domain-level operations are abstracted via interfaces in `YuGiOh.Domain.Serv
 
 Backend Junior Developer | .NET & Clean Architecture
 
-📧 [chavely.gonz.acl@example.com]
+📧 [chavely.gonz.ac@example.com]
 
 ---
