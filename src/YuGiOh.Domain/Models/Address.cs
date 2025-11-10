@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace YuGiOh.Domain.Models
 {
     /// <summary>
@@ -56,11 +58,19 @@ namespace YuGiOh.Domain.Models
         public ICollection<Player> Players { get; set; } = new List<Player>();
 
         /// <summary>
+        /// Gets or sets the tournaments associated with this address.
+        /// </summary>
+        [JsonIgnore]
+        public ICollection<Tournament> Tournaments { get; set; } = new List<Tournament>();
+
+        /// <summary>
         /// Returns a readable representation of the address.
         /// </summary>
         public override string ToString()
         {
-            var parts = new List<string?> { StreetName, Building, Apartment, City, StateIso2, CountryIso2 };
+            var parts = new List<string?> {
+                (StreetType??new StreetType(){ Name = "Calle", Language = "Español" }).Name,
+                StreetName, Building, Apartment, City, StateIso2, CountryIso2 };
             return string.Join(", ", parts.Where(p => !string.IsNullOrWhiteSpace(p)));
         }
     }
