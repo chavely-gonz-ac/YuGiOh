@@ -1,7 +1,9 @@
+using System.Security.Claims;
 using MediatR;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using YuGiOh.Application.Features.TournamentManagement.Commands;
+using YuGiOh.Application.Features.TournamentManagement.Queries;
 using YuGiOh.Domain.Exceptions;
 using YuGiOh.Domain.Models;
 
@@ -10,17 +12,14 @@ namespace YuGiOh.WebAPI.Controllers
     /// <summary>
     /// Provides endpoints for managing Yu-Gi-Oh! tournaments.
     /// </summary>
+    [Authorize]
     [ApiController]
     [Route("api/[controller]/[action]")]
-    public class TournamentController : ControllerBase
+    public class TournamentController : APIControllerBase
     {
-        private readonly IMediator _mediator;
-        private readonly ILogger<TournamentController> _logger;
 
-        public TournamentController(IMediator mediator, ILogger<TournamentController> logger)
+        public TournamentController(IMediator mediator) : base(mediator)
         {
-            _mediator = mediator;
-            _logger = logger;
         }
 
         /// <summary>
@@ -41,20 +40,46 @@ namespace YuGiOh.WebAPI.Controllers
         {
             try
             {
-                var tournament = await _mediator.Send(command);
+                var tournament = await Sender.Send(command);
                 return CreatedAtAction(nameof(CreateTournament), new { id = tournament.Id });
             }
-            catch (APIException apiEx)
+            catch (APIException)
             {
-                _logger.LogError(apiEx, "API error while creating tournament.");
-                return StatusCode((int)apiEx.StatusCode, apiEx.ToSerializableObject());
+                throw;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Unexpected error while creating tournament.");
-                var apiEx = APIException.Internal("Unexpected error while creating tournament.", ex.Message, ex);
-                return StatusCode((int)apiEx.StatusCode, apiEx.ToSerializableObject());
+                throw APIException.Internal("Unexpected error while creating tournament.", ex.Message, ex);
             }
+        }
+        [HttpPost]
+        [Authorize(Roles = "Player")]
+        public async Task<IActionResult> Register(
+            [FromBody] RegisterUserInTournamentCommand command)
+        {
+
+            // Extract the "sub" (subject) or "id" claim from the JWT
+            var userId = User.FindFirstValue(ClaimTypes.NameIdentifier)
+                         ?? User.FindFirstValue("sub")
+                         ?? User.FindFirstValue("id");
+            bool authorized = await Sender.Send(new IsTheOwnerQuery(
+                command.DecksId.First(),
+                userId
+            ));
+            if (!authorized)
+            {
+                throw APIException.Unauthorized("Only the Deck Owner can register it in the tournament.");
+            }
+            await Sender.Send(command);
+            return Ok();
+        }
+        [HttpPost]
+        [Authorize(Roles = "Admin,Sponsor")]
+        public async Task<IActionResult> RegisterManyPlayers(
+            [FromBody] RegisterUserInTournamentCommand command)
+        {
+            await Sender.Send(command);
+            return Ok();
         }
     }
 }

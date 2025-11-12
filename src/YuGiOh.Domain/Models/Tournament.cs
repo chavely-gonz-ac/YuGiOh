@@ -54,6 +54,7 @@ namespace YuGiOh.Domain.Models
         /// Each sponsorship associates a <see cref="Sponsor"/> with the current tournament.
         /// </remarks>
         public ICollection<Sponsorship> SponsoredBy { get; set; } = new List<Sponsorship>();
+        public ICollection<Registration> Registrations { get; set; } = new List<Registration>();
 
         /// <summary>
         /// Gets or sets the UTC timestamp when the tournament was created.

@@ -60,6 +60,15 @@ namespace YuGiOh.WebAPI.Middlewares
             }
             catch (Exception ex)
             {
+                // ✅ Prevent crash: headers can’t be modified after response has started
+                if (context.Response.HasStarted)
+                {
+                    Console.WriteLine("⚠️ Cannot modify response, it has already started.");
+                    return;
+                }
+
+                // Clear any partially written content
+                context.Response.Clear();
                 // Handle unexpected, non-API exceptions (internal errors)
                 context.Response.ContentType = "application/json";
                 context.Response.StatusCode = (int)HttpStatusCode.InternalServerError;

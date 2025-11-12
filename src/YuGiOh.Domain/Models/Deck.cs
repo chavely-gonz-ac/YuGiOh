@@ -74,6 +74,7 @@ namespace YuGiOh.Domain.Models
         /// Navigation property for the Deck's Archetype.
         /// </summary>
         public Archetype? Archetype { get; set; }
+        public ICollection<Registration> Registrations { get; set; } = new List<Registration>();
 
         /// <summary>
         /// Optional collection of Registrations associated with the Deck.
