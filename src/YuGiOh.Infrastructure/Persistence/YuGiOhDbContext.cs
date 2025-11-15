@@ -32,6 +32,8 @@ namespace YuGiOh.Infrastructure.Persistence
         public DbSet<Tournament> Tournaments { get; set; } = default!;
         public DbSet<Sponsorship> Sponsorships { get; set; } = default!;
         public DbSet<Registration> Registrations { get; set; } = default!;
+        public DbSet<Round> Rounds { get; set; } = default!;
+        public DbSet<Match> Matches { get; set; } = default!;
 
         /// <summary>
         /// Configures the entity mappings and Identity schema for the context.

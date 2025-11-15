@@ -55,6 +55,7 @@ namespace YuGiOh.Domain.Models
         /// </remarks>
         public ICollection<Sponsorship> SponsoredBy { get; set; } = new List<Sponsorship>();
         public ICollection<Registration> Registrations { get; set; } = new List<Registration>();
+        public ICollection<Round> Rounds { get; set; } = new List<Round>();
 
         /// <summary>
         /// Gets or sets the UTC timestamp when the tournament was created.

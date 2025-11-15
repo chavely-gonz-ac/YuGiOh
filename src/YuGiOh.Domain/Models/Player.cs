@@ -30,6 +30,7 @@ namespace YuGiOh.Domain.Models
         /// One Player can have many Decks. This represents the one-to-many relationship.
         /// </remarks>
         public ICollection<Deck> Decks { get; set; } = new List<Deck>();
+        public ICollection<Match> Matches { get; set; } = new List<Match>();
 
         /// <summary>
         /// Returns the string representation of the player (its ID).
